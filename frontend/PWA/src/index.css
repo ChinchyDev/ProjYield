@@ -1,0 +1,65 @@
+/* YieldVision PWA — Base styles */
+/* Palette from UI Implementation Plan §2 */
+:root {
+  --bg:       #F7F4EE;
+  --soil:     #1A1208;
+  --green:    #2D6A4F;
+  --green-lt: #52B788;
+  --amber:    #E9A826;
+  --orange:   #F4A261;
+  --red:      #D62828;
+  --blue:     #3A86FF;
+  --slate:    #6C8EBF;
+  --white:    #FFFFFF;
+  --card:     #FFFFFF;
+  --border:   #DDD8CE;
+  --shadow:   0 2px 8px rgba(26,18,8,0.08);
+  --radius:   12px;
+  --radius-sm: 8px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 16px; }
+
+body {
+  font-family: 'Noto Sans', 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--soil);
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+  overscroll-behavior: none;
+}
+
+/* Fitts's Law: every interactive element ≥48px touch target */
+button, a, [role="button"] {
+  min-height: 48px;
+  min-width: 48px;
+  cursor: pointer;
+  border: none;
+  outline: none;
+  text-decoration: none;
+}
+
+button:focus-visible, a:focus-visible {
+  outline: 3px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* Typography */
+h1 { font-family: 'Nunito', sans-serif; font-size: 1.75rem; font-weight: 800; }
+h2 { font-family: 'Nunito', sans-serif; font-size: 1.25rem; font-weight: 700; }
+h3 { font-family: 'Nunito', sans-serif; font-size: 1rem;    font-weight: 700; }
+p  { font-size: 1rem; line-height: 1.6; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* Utils */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0,0,0,0); border: 0;
+}

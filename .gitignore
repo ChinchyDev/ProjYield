@@ -1,0 +1,14 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/research
+/.vs/ProjYield/CopilotIndices/17.14.1561.44479
+/_pycache_
+/.vs
+
+/frontend/PWA/node_modules
+/__pycache__
+/backend/__pycache__
+/~$eldVision_M2_Report.docx
+/QUICK_DEMO_START.md

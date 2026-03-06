@@ -1,0 +1,44 @@
+/* Alerts screen */
+
+.alerts-screen { padding-bottom: 24px; }
+
+.alerts-section { margin-bottom: 8px; }
+
+.alerts-section-label {
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 16px 16px 6px;
+  display: block;
+}
+.alerts-section-label--red   { color: var(--red); }
+.alerts-section-label--amber { color: #b07800; }
+
+.alert-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 16px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1.5px solid transparent;
+}
+
+.alert-card__body { flex: 1; }
+
+.alert-card__message {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--soil);
+  line-height: 1.45;
+}
+
+.alert-act-btn { flex-shrink: 0; }
+
+.alerts-sms-note {
+  padding: 16px;
+  font-size: 0.8rem;
+  color: var(--slate);
+  text-align: center;
+}
