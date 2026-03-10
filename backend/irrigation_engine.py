@@ -1,373 +1,638 @@
 """
 YieldVision Irrigation Engine
-Offloaded irrigation planning and optimization from decision engine
+All math traceable to FAO Irrigation and Drainage Paper No. 56 (FAO56)
+Allen, R.G., Pereira, L.S., Raes, D., & Smith, M. (1998)
+
+Key formulas used:
+  ET0  — Hargreaves-Samani (FAO56 Ch.3, Eq. 52)
+  ETc  — ET0 × Kc  (FAO56 Ch.6)
+  Kc   — by crop and growth stage (FAO56 Table 12)
+  TAW  — (FC% - WP%) × Bd × root_depth (FAO56 Eq. 82)
+  RAW  — p × TAW  (FAO56 Eq. 83), p from FAO56 Table 22
+  Net irrigation depth — (FC - θ) × Bd × Zr (FAO56 Eq. 99)
+  Days until stress — RAW / ETc  (FAO56 Ch.8)
 """
 
-import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
-import json
+import math
+from datetime import datetime, date
+from typing import Dict, Optional, Tuple
 import logging
 
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CONSTANTS FROM FAO56
+# =============================================================================
+
+# Soil type properties — FAO56 Table 1
+# field_capacity_pct, wilting_point_pct, bulk_density_g_cm3, drainage_factor
+SOIL_TYPE_PARAMS: Dict[str, Dict] = {
+    "sandy": {
+        "field_capacity_pct": 12.0,
+        "wilting_point_pct":   5.0,
+        "bulk_density":        1.65,
+        "drainage_factor":     1.35,
+        "source": "FAO56 Table 1"
+    },
+    "sandy_loam": {
+        "field_capacity_pct": 22.0,
+        "wilting_point_pct":   9.0,
+        "bulk_density":        1.45,
+        "drainage_factor":     1.25,
+        "source": "FAO56 Table 1"
+    },
+    "loam": {
+        "field_capacity_pct": 31.0,
+        "wilting_point_pct":  14.0,
+        "bulk_density":        1.25,
+        "drainage_factor":     1.20,
+        "source": "FAO56 Table 1"
+    },
+    "clay_loam": {
+        "field_capacity_pct": 38.0,
+        "wilting_point_pct":  20.0,
+        "bulk_density":        1.15,
+        "drainage_factor":     1.15,
+        "source": "FAO56 Table 1"
+    },
+    "clay": {
+        "field_capacity_pct": 45.0,
+        "wilting_point_pct":  25.0,
+        "bulk_density":        1.10,
+        "drainage_factor":     1.10,
+        "source": "FAO56 Table 1"
+    },
+}
+
+# Crop coefficients by growth stage — FAO56 Table 12
+# depletion_fraction_p — FAO56 Table 22
+# root_depth_cm — FAO56 Table 1 (typical values)
+CROP_FAO_PARAMS: Dict[str, Dict] = {
+    "maize": {
+        "kc_initial":   0.30,
+        "kc_mid":       1.20,
+        "kc_end":       0.35,
+        "depletion_p":  0.55,
+        "root_depth_cm": 60.0,
+        "days_initial":  20,
+        "days_dev":      35,
+        "days_mid":      45,
+        "days_late":     30,
+        "source": "FAO56 Table 12, Table 22"
+    },
+    "beans": {
+        "kc_initial":   0.30,
+        "kc_mid":       1.10,
+        "kc_end":       0.30,
+        "depletion_p":  0.45,
+        "root_depth_cm": 50.0,
+        "days_initial":  15,
+        "days_dev":      25,
+        "days_mid":      25,
+        "days_late":     15,
+        "source": "FAO56 Table 12, Table 22"
+    },
+    "potatoes": {
+        "kc_initial":   0.40,
+        "kc_mid":       1.15,
+        "kc_end":       0.75,
+        "depletion_p":  0.35,
+        "root_depth_cm": 40.0,
+        "days_initial":  25,
+        "days_dev":      30,
+        "days_mid":      30,
+        "days_late":     15,
+        "source": "FAO56 Table 12, Table 22"
+    },
+    "tomatoes": {
+        "kc_initial":   0.40,
+        "kc_mid":       1.15,
+        "kc_end":       0.70,
+        "depletion_p":  0.40,
+        "root_depth_cm": 50.0,
+        "days_initial":  30,
+        "days_dev":      40,
+        "days_mid":      40,
+        "days_late":     25,
+        "source": "FAO56 Table 12, Table 22"
+    },
+    "kale": {
+        "kc_initial":   0.40,
+        "kc_mid":       1.00,
+        "kc_end":       0.95,
+        "depletion_p":  0.45,
+        "root_depth_cm": 35.0,
+        "days_initial":  15,
+        "days_dev":      20,
+        "days_mid":      90,
+        "days_late":     0,   # continuous harvest, no late stage
+        "source": "FAO56 Table 12, Table 22"
+    },
+}
+
+# Extraterrestrial radiation Ra (MJ/m2/day) for Kenya (latitude 0°–4°S)
+# Source: FAO56 Table 2.6 / Annex 2, monthly values for equatorial Africa
+# Using 1°S as representative for Kenyan highlands
+RA_BY_MONTH: Dict[int, float] = {
+    1: 36.8,   # January
+    2: 37.9,   # February
+    3: 37.4,   # March
+    4: 35.3,   # April
+    5: 32.6,   # May
+    6: 31.4,   # June
+    7: 31.8,   # July
+    8: 33.6,   # August
+    9: 36.0,   # September
+    10: 37.2,  # October
+    11: 36.6,  # November
+    12: 36.0,  # December
+}
+
+
+# =============================================================================
+# CORE IRRIGATION ENGINE
+# =============================================================================
+
 class IrrigationEngine:
-    """Intelligent irrigation planning and optimization system"""
-    
+    """
+    FAO56-grounded irrigation scheduling engine.
+    Every calculation stores a full trace of inputs, formula, and source.
+    """
+
     def __init__(self):
-        self.crop_water_requirements = {
-            'maize': {
-                'daily_water_mm': 4.5,
-                'critical_stages': {
-                    'germination': {'duration_days': 10, 'water_factor': 0.7},
-                    'vegetative': {'duration_days': 30, 'water_factor': 1.0},
-                    'flowering': {'duration_days': 15, 'water_factor': 1.3},
-                    'fruiting': {'duration_days': 25, 'water_factor': 1.2},
-                    'maturity': {'duration_days': 20, 'water_factor': 0.8}
-                },
-                'optimal_moisture_range': (30, 45),
-                'water_use_efficiency': 15.0
-            },
-            'tomatoes': {
-                'daily_water_mm': 3.8,
-                'critical_stages': {
-                    'germination': {'duration_days': 8, 'water_factor': 0.6},
-                    'vegetative': {'duration_days': 25, 'water_factor': 0.9},
-                    'flowering': {'duration_days': 20, 'water_factor': 1.4},
-                    'fruiting': {'duration_days': 30, 'water_factor': 1.3},
-                    'maturity': {'duration_days': 15, 'water_factor': 0.9}
-                },
-                'optimal_moisture_range': (35, 50),
-                'water_use_efficiency': 20.0
-            },
-            'beans': {
-                'daily_water_mm': 3.2,
-                'critical_stages': {
-                    'germination': {'duration_days': 7, 'water_factor': 0.6},
-                    'vegetative': {'duration_days': 20, 'water_factor': 0.8},
-                    'flowering': {'duration_days': 15, 'water_factor': 1.2},
-                    'pod_filling': {'duration_days': 18, 'water_factor': 1.3},
-                    'maturity': {'duration_days': 10, 'water_factor': 0.7}
-                },
-                'optimal_moisture_range': (32, 48),
-                'water_use_efficiency': 12.0
-            }
-        }
-        
-        self.soil_water_holding_capacity = {
-            'sandy': {'field_capacity': 15, 'wilting_point': 5, 'available_water': 10},
-            'loamy': {'field_capacity': 25, 'wilting_point': 10, 'available_water': 15},
-            'clay': {'field_capacity': 35, 'wilting_point': 15, 'available_water': 20},
-            'silty': {'field_capacity': 30, 'wilting_point': 12, 'available_water': 18}
-        }
-        
-        self.evapotranspiration_factors = {
-            'cool': 0.7,      # < 20°C
-            'moderate': 1.0,  # 20-25°C
-            'warm': 1.3,      # 25-30°C
-            'hot': 1.6        # > 30°C
-        }
+        self.soil_params = SOIL_TYPE_PARAMS
+        self.crop_params = CROP_FAO_PARAMS
 
-    def calculate_irrigation_requirement(self, zone_data: Dict, crop_type: str, 
-                                        target_yield_kg_per_zone: float) -> Dict:
-        """Calculate irrigation requirement for specific yield goal"""
-        
-        if crop_type not in self.crop_water_requirements:
-            raise ValueError(f"Unsupported crop type: {crop_type}")
-        
-        crop_info = self.crop_water_requirements[crop_type]
-        
-        # Calculate water needed based on water use efficiency
-        water_needed_m3 = target_yield_kg_per_zone / crop_info['water_use_efficiency']
-        water_needed_liters = water_needed_m3 * 1000
-        
-        # Calculate daily water requirement
-        total_growing_days = sum(stage['duration_days'] for stage in crop_info['critical_stages'].values())
-        daily_water_liters = water_needed_liters / total_growing_days
-        
+    # -------------------------------------------------------------------------
+    # 1. ET0 CALCULATION — Hargreaves-Samani
+    #    FAO56 Chapter 3, Equation 52
+    # -------------------------------------------------------------------------
+    def calculate_et0(
+        self,
+        t_max_c: float,
+        t_min_c: float,
+        t_mean_c: Optional[float] = None,
+        month: Optional[int] = None
+    ) -> Dict:
+        """
+        Calculate reference evapotranspiration (ET0) using Hargreaves-Samani.
+
+        Formula: ET0 = 0.0023 × (Tmean + 17.8) × (Tmax - Tmin)^0.5 × Ra
+        Source: FAO56 Chapter 3, Equation 52
+
+        Args:
+            t_max_c: Daily max air temperature (°C) from DHT22
+            t_min_c: Daily min air temperature (°C) from DHT22
+            t_mean_c: Mean temperature (if None, computed as average)
+            month: Calendar month (1-12) for Ra lookup; defaults to current month
+
+        Returns:
+            Dict with et0_mm_day and full calculation trace
+        """
+        if t_mean_c is None:
+            t_mean_c = (t_max_c + t_min_c) / 2.0
+
+        if month is None:
+            month = datetime.now().month
+
+        ra = RA_BY_MONTH.get(month, 35.0)
+
+        # Hargreaves-Samani formula — FAO56 Eq. 52
+        temp_range = max(t_max_c - t_min_c, 0.0)
+        et0 = 0.0023 * (t_mean_c + 17.8) * math.sqrt(temp_range) * ra
+        et0 = max(et0, 0.1)  # floor at 0.1 mm/day — physically unreasonable below this
+
         return {
-            'target_yield_kg_per_zone': target_yield_kg_per_zone,
-            'total_water_required_liters': water_needed_liters,
-            'daily_water_requirement_liters': daily_water_liters,
-            'total_growing_days': total_growing_days,
-            'water_use_efficiency': crop_info['water_use_efficiency'],
-            'crop_type': crop_type
-        }
-
-    def create_irrigation_schedule(self, zone_data: Dict, crop_type: str, 
-                                 target_yield_kg_per_zone: float, 
-                                 planning_period_days: int = 30) -> Dict:
-        """Create detailed irrigation schedule to reach yield goal"""
-        
-        water_req = self.calculate_irrigation_requirement(zone_data, crop_type, target_yield_kg_per_zone)
-        
-        # Get soil and current conditions
-        soil_type = zone_data.get('soil_type', 'loamy')
-        current_moisture = zone_data.get('soil_moisture_20cm', 30.0)
-        temperature = zone_data.get('temperature_c', 25.0)
-        
-        soil_props = self.soil_water_holding_capacity[soil_type]
-        crop_info = self.crop_water_requirements[crop_type]
-        
-        # Determine growth stage
-        days_since_planting = zone_data.get('days_since_planting', 0)
-        current_stage = self._get_growth_stage(crop_type, days_since_planting)
-        
-        # Calculate daily irrigation plan
-        schedule = []
-        cumulative_water = 0
-        
-        for day in range(planning_period_days):
-            date = datetime.now() + timedelta(days=day)
-            
-            # Adjust water requirement based on growth stage
-            stage_factor = crop_info['critical_stages'][current_stage]['water_factor']
-            
-            # Adjust for temperature
-            temp_factor = self._get_temperature_factor(temperature)
-            
-            # Calculate today's water requirement
-            daily_requirement = water_req['daily_water_requirement_liters'] * stage_factor * temp_factor
-            
-            # Check soil moisture deficit
-            optimal_range = crop_info['optimal_moisture_range']
-            moisture_deficit = max(0, optimal_range[0] - current_moisture)
-            
-            # Calculate irrigation amount
-            if moisture_deficit > 0:
-                irrigation_amount = min(daily_requirement, moisture_deficit * 0.4)
-                current_moisture += irrigation_amount * 0.4
-            else:
-                irrigation_amount = 0
-            
-            # Account for daily water loss
-            daily_loss = crop_info['daily_water_mm'] * temp_factor * 0.4
-            current_moisture = max(soil_props['wilting_point'], current_moisture - daily_loss)
-            
-            cumulative_water += irrigation_amount
-            
-            schedule.append({
-                'day': day + 1,
-                'date': date.strftime('%Y-%m-%d'),
-                'growth_stage': current_stage,
-                'irrigation_liters': round(irrigation_amount, 1),
-                'soil_moisture_percent': round(current_moisture, 1),
-                'temperature_factor': temp_factor,
-                'stage_factor': stage_factor,
-                'cumulative_water_liters': round(cumulative_water, 1)
-            })
-            
-            # Update growth stage
-            if day % 7 == 0:
-                days_since_planting += 7
-                current_stage = self._get_growth_stage(crop_type, days_since_planting)
-        
-        return {
-            'zone_id': zone_data.get('zone_id', 'UNKNOWN'),
-            'crop_type': crop_type,
-            'target_yield_kg_per_zone': target_yield_kg_per_zone,
-            'planning_period_days': planning_period_days,
-            'soil_type': soil_type,
-            'initial_soil_moisture': zone_data.get('soil_moisture_20cm', 30.0),
-            'water_requirements': water_req,
-            'irrigation_schedule': schedule,
-            'summary': self._generate_schedule_summary(schedule, water_req)
-        }
-
-    def optimize_for_water_conservation(self, zone_data: Dict, crop_type: str, 
-                                      target_yield_kg_per_zone: float) -> Dict:
-        """Optimize irrigation plan for water conservation while maintaining yield"""
-        
-        # Create standard schedule
-        standard_schedule = self.create_irrigation_schedule(
-            zone_data, crop_type, target_yield_kg_per_zone, planning_period_days=30
-        )
-        
-        # Optimization strategies
-        optimization_strategies = {
-            'timing_optimization': {
-                'description': 'Irrigate during early morning/late evening to reduce evaporation',
-                'water_savings_percent': 15,
-                'implementation': 'Schedule irrigation for 05:00-07:00 and 18:00-20:00'
+            "et0_mm_day": round(et0, 3),
+            "formula": "ET0 = 0.0023 × (Tmean + 17.8) × (Tmax - Tmin)^0.5 × Ra",
+            "inputs": {
+                "t_max_c": t_max_c,
+                "t_min_c": t_min_c,
+                "t_mean_c": round(t_mean_c, 2),
+                "ra_mj_m2_day": ra,
+                "month": month,
             },
-            'moisture_sensor_optimization': {
-                'description': 'Use real-time moisture data to avoid over-irrigation',
-                'water_savings_percent': 20,
-                'implementation': 'Only irrigate when soil moisture falls below 40%'
-            },
-            # FUTURE INTEGRATION: weather_based_adjustment
-            # Requires external weather API (e.g. OpenWeatherMap)
-            # 'weather_based_adjustment': {
-            #     'description': 'Adjust irrigation based on weather forecasts',
-            #     'water_savings_percent': 10,
-            #     'implementation': 'Reduce irrigation by 30% on rainy days'
-            # },
-            'drip_irrigation_upgrade': {
-                'description': 'Switch to drip irrigation for targeted water delivery',
-                'water_savings_percent': 35,
-                'implementation': 'Install drip irrigation system with emitters per zone'
-            }
-        }
-        
-        # Calculate optimized schedules
-        optimized_schedules = {}
-        for strategy_name, strategy_info in optimization_strategies.items():
-            adjusted_schedule = []
-            water_savings_factor = 1 - (strategy_info['water_savings_percent'] / 100)
-            
-            for day_plan in standard_schedule['irrigation_schedule']:
-                optimized_plan = day_plan.copy()
-                optimized_plan['irrigation_liters'] *= water_savings_factor
-                optimized_plan['optimization_strategy'] = strategy_name
-                adjusted_schedule.append(optimized_plan)
-            
-            optimized_schedules[strategy_name] = {
-                'schedule': adjusted_schedule,
-                'total_water_liters': sum(day['irrigation_liters'] for day in adjusted_schedule),
-                'water_savings_liters': standard_schedule['summary']['total_irrigation_liters'] - 
-                                       sum(day['irrigation_liters'] for day in adjusted_schedule),
-                'strategy_info': strategy_info
-            }
-        
-        return {
-            'zone_id': zone_data.get('zone_id', 'UNKNOWN'),
-            'crop_type': crop_type,
-            'target_yield_kg_per_zone': target_yield_kg_per_zone,
-            'standard_schedule': standard_schedule,
-            'optimization_strategies': optimization_strategies,
-            'optimized_schedules': optimized_schedules,
-            'recommendation': self._select_best_optimization(optimized_schedules)
+            "source": "FAO56 Chapter 3, Equation 52 (Hargreaves-Samani)"
         }
 
-    def monitor_irrigation_performance(self, zone_id: str, planned_schedule: List[Dict], 
-                                    actual_moisture_readings: List[Dict]) -> Dict:
-        """Monitor irrigation performance and provide recommendations"""
-        
-        performance_analysis = {
-            'zone_id': zone_id,
-            'monitoring_period_days': len(planned_schedule),
-            'schedule_adherence': {},
-            'efficiency_metrics': {},
-            'recommendations': []
-        }
-        
-        # Compare planned vs actual
-        total_planned_water = sum(day['irrigation_liters'] for day in planned_schedule)
-        
-        # Calculate adherence metrics
-        days_with_data = min(len(planned_schedule), len(actual_moisture_readings))
-        
-        if days_with_data > 0:
-            moisture_deviations = []
-            water_usage_efficiency = []
-            
-            for i in range(days_with_data):
-                planned = planned_schedule[i]
-                actual = actual_moisture_readings[i]
-                
-                # Moisture deviation
-                planned_moisture = planned['soil_moisture_percent']
-                actual_moisture = actual.get('soil_moisture_20cm', planned_moisture)
-                deviation = abs(actual_moisture - planned_moisture)
-                moisture_deviations.append(deviation)
-                
-                # Water usage efficiency
-                if planned['irrigation_liters'] > 0:
-                    efficiency = min(1.0, actual_moisture / planned_moisture)
-                    water_usage_efficiency.append(efficiency)
-            
-            performance_analysis['schedule_adherence'] = {
-                'average_moisture_deviation': np.mean(moisture_deviations),
-                'max_moisture_deviation': np.max(moisture_deviations),
-                'schedule_compliance_percentage': np.mean(water_usage_efficiency) * 100 if water_usage_efficiency else 0
-            }
-            
-            # Generate recommendations
-            avg_deviation = np.mean(moisture_deviations)
-            if avg_deviation > 5.0:
-                performance_analysis['recommendations'].append(
-                    "High moisture variability detected - consider more frequent monitoring"
-                )
-            
-            if np.mean(water_usage_efficiency) < 0.8:
-                performance_analysis['recommendations'].append(
-                    "Irrigation schedule not meeting targets - adjust timing or amounts"
-                )
-            
-            if max(moisture_deviations) > 10.0:
-                performance_analysis['recommendations'].append(
-                    "Extreme moisture deviations - check for irrigation system issues"
-                )
-        
-        return performance_analysis
+    # -------------------------------------------------------------------------
+    # 2. CROP COEFFICIENT — Kc by growth stage
+    #    FAO56 Table 12
+    # -------------------------------------------------------------------------
+    def get_kc(self, crop_name: str, days_since_planting: int) -> Dict:
+        """
+        Get crop coefficient (Kc) for current growth stage.
+        Source: FAO56 Table 12
 
-    def _get_growth_stage(self, crop_type: str, days_since_planting: int) -> str:
-        """Determine current growth stage based on days since planting"""
-        
-        stages = self.crop_water_requirements[crop_type]['critical_stages']
-        cumulative_days = 0
-        
-        for stage_name, stage_info in stages.items():
-            cumulative_days += stage_info['duration_days']
-            if days_since_planting <= cumulative_days:
-                return stage_name
-        
-        return 'maturity'
+        Args:
+            crop_name: 'maize', 'beans', 'potatoes', 'tomatoes', 'kale'
+            days_since_planting: Integer days elapsed since planting
 
-    def _get_temperature_factor(self, temperature_c: float) -> float:
-        """Get temperature-based evapotranspiration factor"""
-        
-        if temperature_c < 20:
-            return self.evapotranspiration_factors['cool']
-        elif temperature_c <= 25:
-            return self.evapotranspiration_factors['moderate']
-        elif temperature_c <= 30:
-            return self.evapotranspiration_factors['warm']
+        Returns:
+            Dict with kc value, stage name, and source
+        """
+        crop = crop_name.lower()
+        params = self.crop_params.get(crop, self.crop_params["maize"])
+
+        d_init = params["days_initial"]
+        d_dev  = params["days_dev"]
+        d_mid  = params["days_mid"]
+        d_late = params["days_late"]
+
+        kc_init = params["kc_initial"]
+        kc_mid  = params["kc_mid"]
+        kc_end  = params["kc_end"]
+
+        # Determine stage and interpolate Kc — FAO56 Ch.6 procedure
+        if days_since_planting <= d_init:
+            stage = "initial"
+            kc = kc_init
+
+        elif days_since_planting <= d_init + d_dev:
+            stage = "development"
+            # Linear interpolation between kc_init and kc_mid
+            progress = (days_since_planting - d_init) / d_dev
+            kc = kc_init + progress * (kc_mid - kc_init)
+
+        elif days_since_planting <= d_init + d_dev + d_mid:
+            stage = "mid"
+            kc = kc_mid
+
+        elif days_since_planting <= d_init + d_dev + d_mid + d_late:
+            stage = "late"
+            progress = (days_since_planting - d_init - d_dev - d_mid) / max(d_late, 1)
+            kc = kc_mid + progress * (kc_end - kc_mid)
+
         else:
-            return self.evapotranspiration_factors['hot']
+            stage = "mature"
+            kc = kc_end
 
-    def _generate_schedule_summary(self, schedule: List[Dict], water_req: Dict) -> Dict:
-        """Generate summary statistics for irrigation schedule"""
-        
-        total_irrigation = sum(day['irrigation_liters'] for day in schedule)
-        irrigated_days = sum(1 for day in schedule if day['irrigation_liters'] > 0)
-        
         return {
-            'total_irrigation_liters': round(total_irrigation, 1),
-            'irrigated_days': irrigated_days,
-            'average_daily_irrigation': round(total_irrigation / len(schedule), 1),
-            'peak_irrigation_day': max(schedule, key=lambda x: x['irrigation_liters'])['day'],
-            'water_efficiency_vs_target': round((total_irrigation / water_req['total_water_required_liters']) * 100, 1)
+            "kc": round(kc, 3),
+            "growth_stage": stage,
+            "days_since_planting": days_since_planting,
+            "source": f"FAO56 Table 12 ({crop})"
         }
 
-    def _select_best_optimization(self, optimized_schedules: Dict) -> Dict:
-        """Select the best optimization strategy based on water savings and feasibility"""
-        
-        best_strategy = None
-        best_score = -1
-        
-        for strategy_name, strategy_data in optimized_schedules.items():
-            water_savings = strategy_data['water_savings_liters']
-            
-            # Simplicity score (lower is better, so we invert)
-            complexity_scores = {
-                'timing_optimization': 1,
-                'moisture_sensor_optimization': 2,
-                # 'weather_based_adjustment': 3,  # FUTURE: requires weather API
-                'drip_irrigation_upgrade': 4
-            }
-            
-            complexity = complexity_scores.get(strategy_name, 5)
-            score = water_savings / complexity  # Higher score is better
-            
-            if score > best_score:
-                best_score = score
-                best_strategy = {
-                    'strategy_name': strategy_name,
-                    'water_savings_liters': water_savings,
-                    'implementation': strategy_data['strategy_info']['implementation'],
-                    'score': round(score, 2)
-                }
-        
-        return best_strategy
+    # -------------------------------------------------------------------------
+    # 3. CROP ET — ETc = ET0 × Kc
+    #    FAO56 Chapter 6
+    # -------------------------------------------------------------------------
+    def calculate_etc(self, et0_mm_day: float, kc: float) -> Dict:
+        """
+        Calculate crop evapotranspiration.
+        Formula: ETc = ET0 × Kc
+        Source: FAO56 Chapter 6, Equation 58
+        """
+        etc = et0_mm_day * kc
+        return {
+            "etc_mm_day": round(etc, 3),
+            "et0_mm_day": et0_mm_day,
+            "kc": kc,
+            "formula": "ETc = ET0 × Kc",
+            "source": "FAO56 Chapter 6, Equation 58"
+        }
 
-# Global instance for use across the application
+    # -------------------------------------------------------------------------
+    # 4. IRRIGATION VOLUME CALCULATION
+    #    FAO56 Chapter 8, Equation 99
+    # -------------------------------------------------------------------------
+    def calculate_irrigation_volume(
+        self,
+        current_moisture_pct: float,
+        soil_type: str,
+        zone_area_m2: float,
+        root_depth_cm: float,
+        drainage_factor: Optional[float] = None
+    ) -> Dict:
+        """
+        Calculate how many liters to apply to bring soil to field capacity.
+
+        Formula: Net irrigation depth (mm) = (FC% - θ%) × Bd × Zr (cm) × 10
+        Then convert mm to liters: liters = depth_mm × area_m2
+        Apply drainage_factor for losses.
+
+        Source: FAO56 Chapter 8, Equation 99
+
+        Args:
+            current_moisture_pct: Current soil moisture % (from ComWinTop sensor)
+            soil_type: 'sandy'/'loam'/'clay' etc.
+            zone_area_m2: Zone area in square meters
+            root_depth_cm: Effective root depth in cm (from crop_varieties table)
+            drainage_factor: Override drainage loss factor (default from soil table)
+
+        Returns:
+            Dict with water_needed_liters and full calculation trace
+        """
+        soil = self.soil_params.get(soil_type, self.soil_params["loam"])
+        fc = soil["field_capacity_pct"]
+        wp = soil["wilting_point_pct"]
+        bd = soil["bulk_density"]
+        df = drainage_factor if drainage_factor else soil["drainage_factor"]
+
+        # Soil moisture deficit
+        deficit_pct = max(fc - current_moisture_pct, 0.0)
+
+        if deficit_pct <= 0:
+            return {
+                "water_needed_liters": 0.0,
+                "already_at_capacity": True,
+                "current_moisture_pct": current_moisture_pct,
+                "field_capacity_pct": fc,
+                "message": "Soil already at or above field capacity"
+            }
+
+        # Net irrigation depth (mm) — FAO56 Eq. 99
+        # depth_mm = deficit% × bulk_density × root_depth_cm × 10
+        # (×10 converts g/cm3 × cm × % to mm)
+        depth_mm = (deficit_pct / 100.0) * bd * root_depth_cm * 10.0
+
+        # Convert mm depth over zone area to liters
+        # 1 mm over 1 m2 = 1 liter
+        net_liters = depth_mm * zone_area_m2
+
+        # Apply drainage factor (accounts for percolation losses)
+        gross_liters = net_liters * df
+
+        return {
+            "water_needed_liters": round(gross_liters, 2),
+            "net_liters_no_losses": round(net_liters, 2),
+            "depth_mm": round(depth_mm, 2),
+            "deficit_pct": round(deficit_pct, 2),
+            "formula": "depth_mm = (FC% - θ%) × Bd × Zr × 10; liters = depth_mm × area_m2 × drainage_factor",
+            "inputs": {
+                "current_moisture_pct": current_moisture_pct,
+                "field_capacity_pct": fc,
+                "wilting_point_pct": wp,
+                "bulk_density_g_cm3": bd,
+                "root_depth_cm": root_depth_cm,
+                "zone_area_m2": zone_area_m2,
+                "drainage_factor": df,
+                "soil_type": soil_type,
+            },
+            "source": "FAO56 Chapter 8, Equation 99"
+        }
+
+    # -------------------------------------------------------------------------
+    # 5. DAYS UNTIL STRESS
+    #    FAO56 Chapter 8
+    # -------------------------------------------------------------------------
+    def days_until_stress(
+        self,
+        current_moisture_pct: float,
+        soil_type: str,
+        root_depth_cm: float,
+        etc_mm_day: float,
+        depletion_p: float
+    ) -> Dict:
+        """
+        How many days before soil moisture drops to stress threshold.
+
+        Formula:
+          TAW = (FC% - WP%) × Bd × Zr × 10  [mm]  — FAO56 Eq. 82
+          RAW = p × TAW                              — FAO56 Eq. 83
+          Current depletion = (FC% - θ%) × Bd × Zr × 10
+          Days until stress = (RAW - current_depletion) / ETc
+
+        Args:
+            current_moisture_pct: Current soil moisture %
+            soil_type: Soil type string
+            root_depth_cm: Root depth in cm
+            etc_mm_day: Crop ET in mm/day
+            depletion_p: Depletion fraction p (from FAO56 Table 22)
+
+        Returns:
+            Dict with days_until_stress and trace
+        """
+        soil = self.soil_params.get(soil_type, self.soil_params["loam"])
+        fc = soil["field_capacity_pct"]
+        wp = soil["wilting_point_pct"]
+        bd = soil["bulk_density"]
+
+        # Total available water (mm) — FAO56 Eq. 82
+        taw = ((fc - wp) / 100.0) * bd * root_depth_cm * 10.0
+
+        # Readily available water (mm) — FAO56 Eq. 83
+        raw = depletion_p * taw
+
+        # Current soil water depletion (mm)
+        current_depletion = max(((fc - current_moisture_pct) / 100.0) * bd * root_depth_cm * 10.0, 0.0)
+
+        # Water remaining before stress threshold
+        buffer_mm = max(raw - current_depletion, 0.0)
+
+        if etc_mm_day <= 0:
+            days = 999.0
+        else:
+            days = buffer_mm / etc_mm_day
+
+        # Stress status
+        if current_moisture_pct <= wp:
+            stress_status = "WILTING — irrigate immediately"
+        elif current_depletion >= raw:
+            stress_status = "STRESS — irrigate today"
+        elif days <= 1:
+            stress_status = "URGENT — irrigate within 24 hours"
+        elif days <= 3:
+            stress_status = "SOON — irrigate within 3 days"
+        else:
+            stress_status = f"OK — next irrigation in ~{days:.1f} days"
+
+        return {
+            "days_until_stress": round(days, 1),
+            "stress_status": stress_status,
+            "taw_mm": round(taw, 2),
+            "raw_mm": round(raw, 2),
+            "current_depletion_mm": round(current_depletion, 2),
+            "buffer_remaining_mm": round(buffer_mm, 2),
+            "formula": "TAW = (FC-WP)×Bd×Zr×10; RAW = p×TAW; days = (RAW - depletion) / ETc",
+            "inputs": {
+                "current_moisture_pct": current_moisture_pct,
+                "field_capacity_pct": fc,
+                "wilting_point_pct": wp,
+                "bulk_density": bd,
+                "root_depth_cm": root_depth_cm,
+                "etc_mm_day": etc_mm_day,
+                "depletion_p": depletion_p,
+            },
+            "source": "FAO56 Chapter 8, Equations 82, 83"
+        }
+
+    # -------------------------------------------------------------------------
+    # 6. FULL IRRIGATION SCHEDULE — combines all above
+    # -------------------------------------------------------------------------
+    def generate_irrigation_schedule(
+        self,
+        zone_data: Dict,
+        crop_name: str,
+        days_since_planting: int,
+        soil_type: str,
+        zone_area_m2: float = 4.0,
+        root_depth_override_cm: Optional[float] = None
+    ) -> Dict:
+        """
+        Generate a complete irrigation recommendation for one zone.
+
+        Args:
+            zone_data: Dict from sensor_readings — must include:
+                soil_moisture_pct, air_temperature_c, air_humidity_pct
+                (Tmax and Tmin estimated from air_temperature_c ± typical diurnal range
+                 when only a single reading is available)
+            crop_name: Crop in this zone
+            days_since_planting: Days elapsed since planting
+            soil_type: Soil classification
+            zone_area_m2: Zone area
+            root_depth_override_cm: Override if crop_varieties table has a better value
+
+        Returns:
+            Full recommendation dict with calculation trace
+        """
+        crop_lower = crop_name.lower()
+        crop_fao = self.crop_params.get(crop_lower, self.crop_params["maize"])
+
+        # --- Temperature inputs ---
+        # DHT22 gives current air temp. Estimate daily range for Hargreaves-Samani.
+        # Kenya highlands diurnal range is typically 8-14°C.
+        t_current = zone_data.get("air_temperature_c", 22.0)
+        t_max = zone_data.get("air_temp_max_c", t_current + 6.0)   # +6 estimate
+        t_min = zone_data.get("air_temp_min_c", t_current - 6.0)   # -6 estimate
+
+        # --- ET0 ---
+        et0_result = self.calculate_et0(
+            t_max_c=t_max,
+            t_min_c=t_min,
+            month=datetime.now().month
+        )
+
+        # --- Kc and growth stage ---
+        kc_result = self.get_kc(crop_lower, days_since_planting)
+
+        # --- ETc ---
+        etc_result = self.calculate_etc(et0_result["et0_mm_day"], kc_result["kc"])
+
+        # --- Root depth ---
+        root_depth = root_depth_override_cm or crop_fao["root_depth_cm"]
+
+        # --- Irrigation volume ---
+        moisture = zone_data.get("soil_moisture_pct", 20.0)
+        vol_result = self.calculate_irrigation_volume(
+            current_moisture_pct=moisture,
+            soil_type=soil_type,
+            zone_area_m2=zone_area_m2,
+            root_depth_cm=root_depth
+        )
+
+        # --- Days until stress ---
+        stress_result = self.days_until_stress(
+            current_moisture_pct=moisture,
+            soil_type=soil_type,
+            root_depth_cm=root_depth,
+            etc_mm_day=etc_result["etc_mm_day"],
+            depletion_p=crop_fao["depletion_p"]
+        )
+
+        # --- Urgency ---
+        days = stress_result["days_until_stress"]
+        if days <= 0 or moisture <= self.soil_params.get(soil_type, {}).get("wilting_point_pct", 14):
+            urgency = "CRITICAL"
+        elif days <= 1:
+            urgency = "HIGH"
+        elif days <= 3:
+            urgency = "MEDIUM"
+        else:
+            urgency = "LOW"
+
+        # --- Plain language action ---
+        water_l = vol_result["water_needed_liters"]
+        if water_l <= 0:
+            action = "No irrigation needed — soil is at field capacity."
+        else:
+            action = (
+                f"Apply {water_l:.1f} litres to zone. "
+                f"Next irrigation needed in ~{days:.1f} days."
+            )
+
+        return {
+            "recommendation_type": "irrigate",
+            "action_description": action,
+            "action_quantity": water_l,
+            "action_unit": "liters",
+            "urgency_level": urgency,
+            "next_irrigation_days": round(days, 1),
+
+            # Full calculation trace stored in DB
+            "calculation_breakdown": {
+                "crop": crop_lower,
+                "growth_stage": kc_result["growth_stage"],
+                "days_since_planting": days_since_planting,
+                "et0": et0_result,
+                "kc": kc_result,
+                "etc": etc_result,
+                "volume": vol_result,
+                "stress": stress_result,
+                "data_sources": [
+                    "FAO56 Ch.3 Eq.52 (Hargreaves-Samani ET0)",
+                    "FAO56 Table 12 (Kc by growth stage)",
+                    "FAO56 Table 22 (depletion fraction p)",
+                    "FAO56 Ch.8 Eq.99 (irrigation depth)",
+                    "FAO56 Ch.8 Eq.82-83 (TAW, RAW)",
+                    "FAO56 Table 1 (soil field capacity)",
+                ]
+            }
+        }
+
+    # -------------------------------------------------------------------------
+    # 7. VALIDATE SENSOR READING (sanity checks before using in calc)
+    # -------------------------------------------------------------------------
+    def validate_sensor_reading(self, reading: Dict) -> Dict:
+        """
+        Check sensor reading for physically impossible or suspicious values.
+        Returns the reading with data_quality_score and validation_flags added.
+        """
+        flags = []
+        score = 1.0
+
+        moisture = reading.get("soil_moisture_pct")
+        ec       = reading.get("electrical_conductivity")
+        ph       = reading.get("ph_level")
+        nitrogen = reading.get("nitrogen_ppm")
+        temp_soil = reading.get("soil_temperature_c")
+        temp_air  = reading.get("air_temperature_c")
+
+        # Physical range checks
+        if moisture is not None:
+            if not (0 <= moisture <= 100):
+                flags.append("MOISTURE_OUT_OF_RANGE")
+                score -= 0.3
+
+        if ph is not None:
+            if not (3.0 <= ph <= 9.0):
+                flags.append("PH_OUT_OF_SENSOR_RANGE")
+                score -= 0.4
+            elif ph < 4.0:
+                flags.append("PH_EXTREMELY_ACIDIC — verify probe calibration")
+                score -= 0.1
+
+        if ec is not None and nitrogen is not None:
+            if ec > 800 and nitrogen < 30:
+                flags.append("HIGH_EC_LOW_NPK — possible sensor error or recent irrigation")
+                score -= 0.15
+
+        if temp_soil is not None and moisture is not None:
+            if moisture > 80 and temp_soil > 30:
+                flags.append("HIGH_MOISTURE_HIGH_TEMP — unusual, verify probe contact")
+                score -= 0.1
+
+        if temp_air is not None and temp_soil is not None:
+            if abs(temp_air - temp_soil) > 20:
+                flags.append("LARGE_AIR_SOIL_TEMP_DIFFERENCE — verify DHT22 placement")
+                score -= 0.1
+
+        reading["data_quality_score"] = max(round(score, 2), 0.0)
+        reading["validation_flags"] = flags
+        return reading
+
+
+# Module-level singleton
 irrigation_engine = IrrigationEngine()

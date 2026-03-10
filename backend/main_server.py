@@ -1,516 +1,945 @@
 """
 YieldVision Precision Farming Server
-Main FastAPI server with RTX 3070 GPU support
+FastAPI backend — PostgreSQL only, offline-first architecture
+
+Endpoints:
+  POST /readings/upload        — batch upload from rover SD card (idempotent)
+  POST /readings/single        — single live reading
+  GET  /zones/{zone_id}/state  — current state from zone_current_state view
+  GET  /farms/{farm_id}/summary — farm overview
+  GET  /farms/{farm_id}/recommendations — pending recommendations
+  POST /recommendations/{id}/apply — mark recommendation as applied
+  GET  /farms/detect           — GPS farm detection (which farm is rover on?)
+  POST /farms/register         — register a new farm
+  POST /zones/register         — register zones within a farm
+  GET  /crops/varieties        — list crop varieties from DB
+  GET  /market/prices/{crop}   — latest market price for a crop
+  GET  /rover/schedule/{farm_id} — rover priority queue
+  GET  /health                 — server health check
 """
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import torch
-import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional
-import json
+import logging
 import os
+import json
 from contextlib import asynccontextmanager
+from datetime import datetime, date
+from typing import Dict, List, Optional, Any
 
-# Import backend modules
+import uvicorn
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
 from decision_engine import decision_engine
-from precision_models import soil_model, water_model, seed_model
+from precision_models import soil_model, seed_model
 from irrigation_engine import irrigation_engine
-from edge_storage import edge_storage
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("yieldvision")
+
+
+# =============================================================================
+# DATABASE CONNECTION
+# =============================================================================
+
+DB_CONFIG = {
+    "host":     os.getenv("DB_HOST",     "localhost"),
+    "port":     int(os.getenv("DB_PORT", "5432")),
+    "database": os.getenv("DB_NAME",     "yieldvision"),
+    "user":     os.getenv("DB_USER",     "postgres"),
+    "password": os.getenv("DB_PASSWORD", ""),
+}
+
+def get_db():
+    """Get a PostgreSQL connection. Caller must close it."""
+    conn = psycopg2.connect(**DB_CONFIG)
+    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    return conn
+
+def set_farm_context(conn, farm_id: str):
+    """
+    Set Row Level Security session variable so DB only returns this farm's rows.
+    Architecture decision [1] — RLS enforced at DB level.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SET app.current_farm_id = %s", (str(farm_id),))
+
+
+# =============================================================================
+# PYDANTIC MODELS (request/response shapes)
+# =============================================================================
+
+class SensorReading(BaseModel):
+    """Single sensor reading from ComWinTop 7-in-1 + DHT22"""
+    zone_id:                str
+    farm_id:                str
+    rover_id:               str = "ROVER_01"
+    collected_at:           Optional[str] = None
+
+    # GPS
+    gps_lat:                Optional[float] = None
+    gps_lon:                Optional[float] = None
+    gps_accuracy_m:         Optional[float] = None
+
+    # ComWinTop RS485 sensor — register addresses per manual
+    # 0x0004=Nitrogen, 0x0005=Phosphorus, 0x0006=Potassium (mg/kg)
+    # 0x0003=pH (×0.1), 0x0000=Humidity(%×0.1), 0x0001=Temp(°C×0.1)
+    # 0x0002=EC(µS/cm), 0x0007=Salinity, 0x0008=TDS
+    nitrogen_ppm:           Optional[float] = None
+    phosphorus_ppm:         Optional[float] = None
+    potassium_ppm:          Optional[float] = None
+    ph_level:               Optional[float] = None
+    soil_moisture_pct:      Optional[float] = None
+    soil_temperature_c:     Optional[float] = None
+    electrical_conductivity:Optional[float] = None
+
+    # DHT22
+    air_temperature_c:      Optional[float] = None
+    air_humidity_pct:       Optional[float] = None
+
+    # SD card sync metadata
+    sequence_number:        int = 0
+    synced_from_sd:         bool = True
+    sd_file_name:           Optional[str] = None
+    sensor_battery_v:       Optional[float] = None
+
+
+class BatchUpload(BaseModel):
+    """Batch upload from rover SD card — idempotent [3]"""
+    rover_id:   str = "ROVER_01"
+    readings:   List[SensorReading]
+
+
+class RecommendationApply(BaseModel):
+    was_applied:     bool
+    applied_at:      Optional[str] = None
+    farmer_feedback: Optional[str] = None
+
+
+class FarmRegistration(BaseModel):
+    farm_name:       str
+    owner_name:      str
+    owner_phone:     Optional[str] = None
+    county:          str
+    soil_type:       str = "loam"
+    rainfall_zone:   str = "medium"
+    altitude_m:      Optional[float] = None
+    latitude_center: Optional[float] = None
+    longitude_center:Optional[float] = None
+
+
+class ZoneRegistration(BaseModel):
+    farm_id:     str
+    zone_label:  str
+    area_m2:     float = 4.0
+    center_lat:  float
+    center_lon:  float
+    soil_type:   Optional[str] = None
+    notes:       Optional[str] = None
+
+
+# =============================================================================
+# APP LIFECYCLE
+# =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_mock_data_on_startup()
+    logger.info("YieldVision server starting...")
+    try:
+        conn = get_db()
+        conn.close()
+        logger.info("Database connection OK")
+    except Exception as e:
+        logger.warning(f"Database not available: {e}. Running in limited mode.")
     yield
+    logger.info("YieldVision server shutting down.")
 
-app = FastAPI(title="YieldVision Precision Farming API", version="1.0.0", lifespan=lifespan)
 
-# Enable CORS for local development
+app = FastAPI(
+    title="YieldVision Precision Farming API",
+    version="2.0.0",
+    description="Research-backed precision farming decisions for Kenyan smallholders",
+    lifespan=lifespan
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# GPU Check
-GPU_AVAILABLE = torch.cuda.is_available()
-if GPU_AVAILABLE:
-    print(f"GPU detected: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-else:
-    print("No GPU detected - using CPU")
 
-# In-memory storage for development (will be replaced with databases)
-precision_zones = {}
-sensor_data = []
-decisions = []
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
 
-# Zone label mapping: short readable labels like AA, AB, AC...
-zone_labels = {}  # zone_id -> label (e.g. "AA")
-
-def _generate_zone_labels(zone_ids: list) -> dict:
-    """Generate short alphabetic labels AA, AB, AC... BA, BB... for zones"""
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    labels = {}
-    for i, zid in enumerate(sorted(zone_ids)):
-        first = letters[i // 26] if i // 26 < 26 else "Z"
-        second = letters[i % 26]
-        labels[zid] = f"{first}{second}"
-    return labels
-
-class PrecisionZone:
-    """Represents a 2m x 2m precision farming zone"""
-    def __init__(self, zone_id: str, center_lat: float, center_lon: float):
-        self.zone_id = zone_id
-        self.center_lat = center_lat
-        self.center_lon = center_lon
-        self.area_m2 = 4.0  # 2m x 2m
-        self.soil_type = "unknown"
-        self.slope_percent = 0.0
-        self.aspect_degrees = 0
-        self.drainage_rate = "medium"
-        self.created_at = datetime.now()
-
-def _load_mock_data_on_startup():
-    """Load mock zones and sensor readings into memory for demo mode"""
-    mock_dir = os.path.join(os.path.dirname(__file__), "..", "mock_data")
-    
-    zones_file = os.path.join(mock_dir, "mock_zones.json")
-    if os.path.exists(zones_file):
-        with open(zones_file, "r") as f:
-            zones_list = json.load(f)
-        for z in zones_list:
-            zone_id = z["zone_id"]
-            zone = PrecisionZone(zone_id, z["center_lat"], z["center_lon"])
-            zone.soil_type = z.get("soil_type", "loamy")
-            zone.slope_percent = z.get("slope_percent", 0.0)
-            zone.aspect_degrees = z.get("aspect_degrees", 0)
-            zone.drainage_rate = z.get("drainage_rate", "medium")
-            precision_zones[zone_id] = zone
-            
-            # Store in edge storage
-            edge_storage.store_zone({
-                'zone_id': zone_id,
-                'center_lat': z["center_lat"],
-                'center_lon': z["center_lon"],
-                'area_m2': 4.0,
-                'soil_type': zone.soil_type,
-                'slope_percent': zone.slope_percent,
-                'aspect_degrees': zone.aspect_degrees,
-                'drainage_rate': zone.drainage_rate
-            })
-        
-        # Generate short labels for all zones
-        zone_labels.update(_generate_zone_labels(list(precision_zones.keys())))
-        print(f"Demo: loaded {len(zones_list)} zones from mock_zones.json")
-    
-    readings_file = os.path.join(mock_dir, "mock_sensor_readings.json")
-    if os.path.exists(readings_file):
-        with open(readings_file, "r") as f:
-            readings_list = json.load(f)
-        for r in readings_list:
-            sensor_data.append(r)
-            
-            # Store in edge storage
-            edge_storage.store_sensor_reading(r)
-        
-        print(f"Demo: loaded {len(readings_list)} sensor readings from mock_sensor_readings.json")
-
-class SensorReading:
-    """Precision sensor reading for a specific zone"""
-    def __init__(self, zone_id: str, gps_lat: float, gps_lon: float):
-        self.zone_id = zone_id
-        self.gps_lat = gps_lat
-        self.gps_lon = gps_lon
-        self.soil_moisture_5cm = 0.0
-        self.soil_moisture_20cm = 0.0
-        self.nitrogen_ppm = 0.0
-        self.phosphorus_ppm = 0.0
-        self.potassium_ppm = 0.0
-        self.ph_level = 7.0
-        self.temperature_c = 25.0
-        self.organic_matter_percent = 2.0
-        self.timestamp = datetime.now()
-
-def calculate_zone_id(lat: float, lon: float) -> str:
-    """Generate zone ID from GPS coordinates (2m grid)"""
-    # Convert to 2m grid coordinates
-    lat_grid = int(lat * 50000) / 50000  # ~2m precision
-    lon_grid = int(lon * 50000) / 50000
-    return f"Z_{lat_grid:.6f}_{lon_grid:.6f}"
-
-@app.get("/")
-async def root():
-    return {
-        "message": "YieldVision Precision Farming API",
-        "gpu_available": GPU_AVAILABLE,
-        "zones_count": len(precision_zones),
-        "sensor_readings": len(sensor_data)
-    }
-
-@app.get("/api/precision/status")
-async def get_system_status():
-    """Get system status and GPU information"""
-    status = {
-        "system": "YieldVision Precision Farming",
-        "gpu_available": GPU_AVAILABLE,
-        "zones_mapped": len(precision_zones),
-        "total_sensor_readings": len(sensor_data),
-        "decisions_made": len(decisions),
-        "server_time": datetime.now().isoformat(),
-        "edge_storage_status": edge_storage.get_sync_status()
-    }
-    
-    if GPU_AVAILABLE:
-        status.update({
-            "gpu_name": torch.cuda.get_device_name(0),
-            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB",
-            "gpu_memory_used": f"{torch.cuda.memory_allocated(0) / 1e9:.1f} GB"
-        })
-    
-    return status
-
-@app.post("/api/precision/sensor-data")
-async def receive_sensor_data(data: Dict):
-    """Receive precision sensor data from Arduino rover"""
+@app.get("/health")
+def health_check():
+    """Server health + DB connectivity check"""
+    db_ok = False
     try:
-        # Extract sensor data
-        gps_lat = data.get('gps_lat')
-        gps_lon = data.get('gps_lon')
-        
-        if not gps_lat or not gps_lon:
-            raise HTTPException(status_code=400, detail="GPS coordinates required")
-        
-        # Calculate or get zone ID
-        zone_id = data.get('zone_id') or calculate_zone_id(gps_lat, gps_lon)
-        
-        # Create zone if it doesn't exist
-        if zone_id not in precision_zones:
-            precision_zones[zone_id] = PrecisionZone(zone_id, gps_lat, gps_lon)
-        
-        # Create sensor reading
-        reading = SensorReading(zone_id, gps_lat, gps_lon)
-        reading.soil_moisture_5cm = data.get('soil_moisture_5cm', 0.0)
-        reading.soil_moisture_20cm = data.get('soil_moisture_20cm', 0.0)
-        reading.nitrogen_ppm = data.get('nitrogen_ppm', 0.0)
-        reading.phosphorus_ppm = data.get('phosphorus_ppm', 0.0)
-        reading.potassium_ppm = data.get('potassium_ppm', 0.0)
-        reading.ph_level = data.get('ph_level', 7.0)
-        reading.temperature_c = data.get('temperature_c', 25.0)
-        reading.organic_matter_percent = data.get('organic_matter_percent', 2.0)
-        
-        sensor_data.append(reading.__dict__)
-        
-        # Store in edge storage
-        edge_storage.store_sensor_reading(reading.__dict__)
-        
-        return {
-            "status": "success",
-            "zone_id": zone_id,
-            "reading_count": len(sensor_data),
-            "message": f"Sensor data received for zone {zone_id}"
-        }
-        
+        conn = get_db()
+        conn.close()
+        db_ok = True
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing sensor data: {str(e)}")
+        pass
 
-@app.get("/api/precision/zones")
-async def get_zones():
-    """Get all mapped precision zones with short labels"""
-    zones_list = []
-    for zone_id, zone in precision_zones.items():
-        zones_list.append({
-            "zone_id": zone.zone_id,
-            "zone_label": zone_labels.get(zone_id, zone_id),
-            "center_lat": zone.center_lat,
-            "center_lon": zone.center_lon,
-            "area_m2": zone.area_m2,
-            "soil_type": zone.soil_type,
-            "slope_percent": zone.slope_percent,
-            "aspect_degrees": zone.aspect_degrees,
-            "created_at": zone.created_at.isoformat()
-        })
-    
-    return {"zones": zones_list, "total_count": len(zones_list)}
+    return {
+        "status": "ok",
+        "database": "connected" if db_ok else "unavailable",
+        "version": "2.0.0",
+        "timestamp": datetime.now().isoformat()
+    }
 
-@app.get("/api/precision/zones/summary")
-async def get_zones_summary():
-    """Get zone summary with latest sensor readings for dashboard display"""
-    summary = []
-    for zone_id, zone in precision_zones.items():
-        zone_readings = [r for r in sensor_data if r.get('zone_id') == zone_id]
-        latest = zone_readings[-1] if zone_readings else {}
-        moisture = latest.get('soil_moisture_20cm', None)
-        nitrogen = latest.get('nitrogen_ppm', None)
-        ph = latest.get('ph_level', None)
-        
-        # Compute soil health status
-        if moisture is not None:
-            if 30 <= moisture <= 45 and ph and 6.0 <= ph <= 7.0 and nitrogen and nitrogen >= 80:
-                status = "good"
-            elif moisture < 20 or (ph and (ph < 5.5 or ph > 8.0)) or (nitrogen and nitrogen < 40):
-                status = "danger"
-            else:
-                status = "average"
-        else:
-            status = "unknown"
 
-        summary.append({
-            "zone_id": zone_id,
-            "zone_label": zone_labels.get(zone_id, zone_id),
-            "soil_type": zone.soil_type,
-            "soil_moisture_20cm": round(moisture, 1) if moisture else None,
-            "nitrogen_ppm": round(nitrogen, 1) if nitrogen else None,
-            "ph_level": round(ph, 2) if ph else None,
-            "status": status,
-            "has_data": bool(latest),
-        })
-    return {"zones": summary, "total_count": len(summary)}
+# =============================================================================
+# SENSOR READING UPLOAD
+# =============================================================================
 
-@app.get("/api/precision/auto-decisions")
-async def get_auto_decisions():
-    """Auto-generate 5 best action recommendations per zone using Monte Carlo"""
-    ACTION_CANDIDATES = [
-        {"type": "irrigate",             "amount": 10, "label": "Irrigate 10L"},
-        {"type": "irrigate",             "amount": 20, "label": "Irrigate 20L"},
-        {"type": "fertilize_nitrogen",   "amount": 5,  "label": "Add Nitrogen 5kg"},
-        {"type": "fertilize_nitrogen",   "amount": 10, "label": "Add Nitrogen 10kg"},
-        {"type": "fertilize_phosphorus", "amount": 5,  "label": "Add Phosphorus 5kg"},
-        {"type": "fertilize_potassium",  "amount": 5,  "label": "Add Potassium 5kg"},
-        {"type": "adjust_ph_up",         "amount": 3,  "label": "Raise pH (lime 3L)"},
-        {"type": "adjust_ph_down",       "amount": 3,  "label": "Lower pH (sulfur 3L)"},
-    ]
+@app.post("/readings/upload")
+def batch_upload_readings(batch: BatchUpload):
+    """
+    Bulk upload readings from rover SD card.
+    Idempotent — safe to retry, duplicates silently ignored. [3]
+    Returns count of new readings inserted vs duplicates skipped.
+    """
+    inserted = 0
+    skipped = 0
+    errors = []
 
-    all_recommendations = []
-    for zone_id, zone in list(precision_zones.items()):
-        zone_readings = [r for r in sensor_data if r.get('zone_id') == zone_id]
-        if not zone_readings:
-            continue
-        latest = zone_readings[-1]
-        zone_data = {
-            "zone_id": zone_id,
-            "soil_moisture_20cm": latest.get("soil_moisture_20cm", 30),
-            "nitrogen_ppm": latest.get("nitrogen_ppm", 50),
-            "phosphorus_ppm": latest.get("phosphorus_ppm", 30),
-            "potassium_ppm": latest.get("potassium_ppm", 40),
-            "ph_level": latest.get("ph_level", 7.0),
-            "temperature_c": latest.get("soil_temperature_c", 25.0),
-            "organic_matter_percent": latest.get("organic_matter_percent", 2.0),
-            "soil_type": zone.soil_type,
-        }
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-        scored = []
-        for action in ACTION_CANDIDATES:
+        for reading in batch.readings:
             try:
-                result = decision_engine.evaluate_action(zone_data, action, time_horizon=14)
-                scored.append({
-                    "action_label": action["label"],
-                    "action": action,
-                    "expected_yield_kg": round(result["expected_yield_kg_per_zone"]["mean"], 2),
-                    "net_benefit_usd": round(result["expected_net_benefit_usd"]["mean"], 2),
-                    "roi": round(result["expected_roi_multiplier"]["mean"], 2),
-                    "risk": result["risk_assessment"]["risk_level"],
-                    "recommendation": result["recommendation"],
-                    "confidence": round(result["confidence_score"], 2),
-                })
-            except Exception:
-                pass
+                # Build full reading dict for storage
+                raw = reading.dict()
+                collected_dt = datetime.fromisoformat(reading.collected_at) \
+                    if reading.collected_at else datetime.now()
 
-        # Sort by net benefit descending, pick top 5
-        top5 = sorted(scored, key=lambda x: x["net_benefit_usd"], reverse=True)[:5]
-        all_recommendations.append({
-            "zone_id": zone_id,
-            "zone_label": zone_labels.get(zone_id, zone_id),
-            "top_actions": top5,
-        })
+                prepared = decision_engine.prepare_reading_for_storage(
+                    raw_sensor_data=raw,
+                    rover_id=batch.rover_id,
+                    sequence_number=reading.sequence_number,
+                    collected_at=collected_dt
+                )
 
-    return {"recommendations": all_recommendations}
+                # Set farm RLS context
+                set_farm_context(conn, reading.farm_id)
 
-@app.get("/api/precision/zone/{zone_id}/decisions")
-async def get_zone_decisions(zone_id: str):
-    """Auto-generate top-5 decisions for a single zone using Monte Carlo"""
-    if zone_id not in precision_zones:
-        raise HTTPException(status_code=404, detail="Zone not found")
+                # INSERT ON CONFLICT DO NOTHING — idempotent [3]
+                cur.execute("""
+                    INSERT INTO sensor_readings (
+                        reading_uuid, zone_id, farm_id, rover_id, collected_at,
+                        gps_lat, gps_lon, gps_accuracy_m,
+                        nitrogen_ppm, phosphorus_ppm, potassium_ppm,
+                        ph_level, soil_moisture_pct, soil_temperature_c,
+                        electrical_conductivity, air_temperature_c, air_humidity_pct,
+                        computed_et0_mm_day, et_calc_method,
+                        data_quality_score, validation_flags,
+                        sensor_battery_v, synced_from_sd, sd_file_name
+                    ) VALUES (
+                        %(reading_uuid)s, %(zone_id)s, %(farm_id)s, %(rover_id)s,
+                        %(collected_at)s, %(gps_lat)s, %(gps_lon)s, %(gps_accuracy_m)s,
+                        %(nitrogen_ppm)s, %(phosphorus_ppm)s, %(potassium_ppm)s,
+                        %(ph_level)s, %(soil_moisture_pct)s, %(soil_temperature_c)s,
+                        %(electrical_conductivity)s, %(air_temperature_c)s,
+                        %(air_humidity_pct)s, %(computed_et0_mm_day)s,
+                        %(et_calc_method)s, %(data_quality_score)s,
+                        %(validation_flags)s, %(sensor_battery_v)s,
+                        %(synced_from_sd)s, %(sd_file_name)s
+                    )
+                    ON CONFLICT (reading_uuid) DO NOTHING
+                """, prepared)
 
-    ACTION_CANDIDATES = [
-        {"type": "irrigate",             "amount": 10, "label": "Irrigate 10L"},
-        {"type": "irrigate",             "amount": 20, "label": "Irrigate 20L"},
-        {"type": "fertilize_nitrogen",   "amount": 5,  "label": "Add Nitrogen 5kg"},
-        {"type": "fertilize_nitrogen",   "amount": 10, "label": "Add Nitrogen 10kg"},
-        {"type": "fertilize_phosphorus", "amount": 5,  "label": "Add Phosphorus 5kg"},
-        {"type": "fertilize_potassium",  "amount": 5,  "label": "Add Potassium 5kg"},
-        {"type": "adjust_ph_up",         "amount": 3,  "label": "Raise pH (lime 3L)"},
-        {"type": "adjust_ph_down",       "amount": 3,  "label": "Lower pH (sulfur 3L)"},
-    ]
+                if cur.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
 
-    zone = precision_zones[zone_id]
-    zone_readings = [r for r in sensor_data if r.get('zone_id') == zone_id]
-    if not zone_readings:
-        raise HTTPException(status_code=404, detail="No sensor data for zone")
-    latest = zone_readings[-1]
-    zone_data = {
-        "zone_id": zone_id,
-        "soil_moisture_20cm": latest.get("soil_moisture_20cm", 30),
-        "nitrogen_ppm": latest.get("nitrogen_ppm", 50),
-        "phosphorus_ppm": latest.get("phosphorus_ppm", 30),
-        "potassium_ppm": latest.get("potassium_ppm", 40),
-        "ph_level": latest.get("ph_level", 7.0),
-        "temperature_c": latest.get("soil_temperature_c", 25.0),
-        "organic_matter_percent": latest.get("organic_matter_percent", 2.0),
-        "soil_type": zone.soil_type,
-    }
+            except Exception as e:
+                errors.append({"reading": reading.dict().get("sequence_number"), "error": str(e)})
+                logger.error(f"Error inserting reading: {e}")
 
-    scored = []
-    for action in ACTION_CANDIDATES:
-        try:
-            result = decision_engine.evaluate_action(zone_data, action, time_horizon=14)
-            scored.append({
-                "action_label": action["label"],
-                "action": action,
-                "expected_yield_kg": round(result["expected_yield_kg_per_zone"]["mean"], 2),
-                "net_benefit_usd": round(result["expected_net_benefit_usd"]["mean"], 2),
-                "roi": round(result["expected_roi_multiplier"]["mean"], 2),
-                "risk": result["risk_assessment"]["risk_level"],
-                "recommendation": result["recommendation"],
-                "confidence": round(result["confidence_score"], 2),
-            })
-        except Exception:
-            pass
+        conn.commit()
+        cur.close()
+        conn.close()
 
-    top5 = sorted(scored, key=lambda x: x["net_benefit_usd"], reverse=True)[:5]
+    except Exception as e:
+        logger.error(f"Batch upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {
-        "zone_id": zone_id,
-        "zone_label": zone_labels.get(zone_id, zone_id),
-        "top_actions": top5,
+        "status": "ok",
+        "inserted": inserted,
+        "skipped_duplicates": skipped,
+        "errors": errors,
+        "total_received": len(batch.readings)
     }
 
-# Irrigation Planning Endpoints (using irrigation_engine)
-@app.post("/api/irrigation/plan-from-yield-goal")
-async def create_irrigation_plan_from_yield_goal(data: Dict):
-    """Create irrigation plan based on yield goal"""
+
+@app.post("/readings/single")
+def upload_single_reading(reading: SensorReading):
+    """Upload a single sensor reading (for live reads when WiFi available)."""
+    batch = BatchUpload(rover_id=reading.rover_id, readings=[reading])
+    return batch_upload_readings(batch)
+
+
+# =============================================================================
+# ZONE STATE & RECOMMENDATIONS
+# =============================================================================
+
+@app.get("/zones/{zone_id}/state")
+def get_zone_state(zone_id: str, farm_id: str = Query(...)):
+    """
+    Get current zone state from zone_current_state view.
+    Includes staleness flags, active crop, and latest sensor values. [4]
+    """
     try:
-        zone_id = data.get('zone_id')
-        crop_type = data.get('crop_type')
-        target_yield_kg_per_zone = data.get('target_yield_kg_per_zone')
-        
-        if not all([zone_id, crop_type, target_yield_kg_per_zone]):
-            raise HTTPException(status_code=400, detail="Missing required fields: zone_id, crop_type, target_yield_kg_per_zone")
-        
-        # Get zone data
-        if zone_id not in precision_zones:
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT * FROM zone_current_state
+            WHERE zone_id = %s AND farm_id = %s::uuid
+        """, (zone_id, farm_id))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
             raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
-        
-        zone_data = precision_zones[zone_id].copy()
-        zone_data['zone_id'] = zone_id
-        
-        # Add recent sensor data
-        zone_readings = [r for r in sensor_data if r.get('zone_id') == zone_id]
-        if zone_readings:
-            latest_reading = zone_readings[-1]
-            zone_data.update(latest_reading)
-        
-        # Create irrigation plan using irrigation_engine
-        irrigation_plan = irrigation_engine.create_irrigation_schedule(
-            zone_data, crop_type, target_yield_kg_per_zone
-        )
-        
-        return {
-            "success": True,
-            "irrigation_plan": irrigation_plan,
-            "created_at": datetime.now().isoformat()
+
+        return dict(row)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Zone state error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/zones/{zone_id}/recommend")
+def generate_recommendations(zone_id: str, farm_id: str = Query(...)):
+    """
+    Generate fresh recommendations for a zone based on latest sensor readings.
+    Stores results in recommendations table.
+    Returns recommendations with urgency, cost in KES, and calculation trace.
+    """
+    try:
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        # Get zone state from view
+        cur.execute("""
+            SELECT zcs.*, z.soil_type, z.area_m2,
+                   cv.kc_mid, cv.root_depth_cm, cv.depletion_fraction_p,
+                   f.altitude_m, f.rainfall_zone, f.county
+            FROM zone_current_state zcs
+            JOIN zones z ON zcs.zone_id = z.zone_id
+            JOIN farms f ON z.farm_id = f.farm_id
+            LEFT JOIN crop_varieties cv ON zcs.variety_id = cv.variety_id
+            WHERE zcs.zone_id = %s::uuid AND zcs.farm_id = %s::uuid
+        """, (zone_id, farm_id))
+
+        state = cur.fetchone()
+        if not state:
+            raise HTTPException(status_code=404, detail="Zone not found")
+
+        state = dict(state)
+
+        # How many times has farmer previously ignored each type?
+        cur.execute("""
+            SELECT recommendation_type, SUM(ignored_count) as total_ignored
+            FROM recommendations
+            WHERE zone_id = %s::uuid AND farm_id = %s::uuid
+            GROUP BY recommendation_type
+        """, (zone_id, farm_id))
+        ignored_rows = cur.fetchall()
+        ignored_counts = {r["recommendation_type"]: (r["total_ignored"] or 0) for r in ignored_rows}
+
+        # Build inputs for decision engine
+        zone_data = {
+            "zone_id":                zone_id,
+            "farm_id":                farm_id,
+            "ph_level":               state.get("ph_level"),
+            "nitrogen_ppm":           state.get("nitrogen_ppm"),
+            "phosphorus_ppm":         state.get("phosphorus_ppm"),
+            "potassium_ppm":          state.get("potassium_ppm"),
+            "soil_moisture_pct":      state.get("soil_moisture_pct"),
+            "soil_temperature_c":     state.get("soil_temperature_c"),
+            "air_temperature_c":      state.get("air_temperature_c"),
+            "air_humidity_pct":       state.get("air_humidity_pct"),
+            "electrical_conductivity":state.get("electrical_conductivity"),
+            "data_quality_score":     state.get("data_quality_score", 1.0),
+            "validation_flags":       state.get("validation_flags") or [],
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating irrigation plan: {str(e)}")
 
-@app.post("/api/irrigation/optimize")
-async def optimize_irrigation_schedule(data: Dict):
-    """Optimize irrigation schedule for water conservation"""
-    try:
-        zone_id = data.get('zone_id')
-        crop_type = data.get('crop_type')
-        target_yield_kg_per_zone = data.get('target_yield_kg_per_zone')
-        
-        if not all([zone_id, crop_type, target_yield_kg_per_zone]):
-            raise HTTPException(status_code=400, detail="Missing required fields")
-        
-        # Get zone data
-        if zone_id not in precision_zones:
-            raise HTTPException(status_code=404, detail="Zone {zone_id} not found")
-        
-        zone_data = precision_zones[zone_id].copy()
-        zone_data['zone_id'] = zone_id
-        
-        # Add recent sensor data
-        zone_readings = [r for r in sensor_data if r.get('zone_id') == zone_id]
-        if zone_readings:
-            latest_reading = zone_readings[-1]
-            zone_data.update(latest_reading)
-        
-        # Create optimization plan using irrigation_engine
-        optimization = irrigation_engine.optimize_for_water_conservation(
-            zone_data, crop_type, target_yield_kg_per_zone
-        )
-        
-        return {
-            "success": True,
-            "optimization_plan": optimization,
-            "created_at": datetime.now().isoformat()
+        farm_context = {
+            "crop_name":       state.get("crop_name", "maize"),
+            "variety_name":    state.get("variety_name"),
+            "soil_type":       state.get("soil_type", "loam"),
+            "zone_area_m2":    state.get("area_m2", 4.0),
+            "planting_date":   state.get("planting_date"),
+            "altitude_m":      state.get("altitude_m", 1500.0),
+            "rainfall_zone":   state.get("rainfall_zone", "medium"),
+            "planting_id":     str(state.get("planting_id")) if state.get("planting_id") else None,
+            "reading_uuid":    state.get("last_reading_uuid"),
+            "root_depth_cm":   state.get("root_depth_cm", 40.0),
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error optimizing irrigation: {str(e)}")
 
-# Edge Storage Endpoints
-@app.post("/api/edge/sync")
-async def sync_edge_to_cloud():
-    """Sync edge data to cloud PostgreSQL"""
+        # Generate recommendations
+        result = decision_engine.generate_zone_recommendations(
+            zone_data=zone_data,
+            farm_context=farm_context,
+            ignored_counts=ignored_counts
+        )
+
+        # Store each recommendation in DB
+        for rec in result.get("recommendations", []):
+            if rec.get("recommendation_type") == "monitor":
+                continue  # Don't store low-value monitor recommendations
+
+            cur.execute("""
+                INSERT INTO recommendations (
+                    zone_id, farm_id, planting_id, based_on_reading_uuid,
+                    recommendation_type, action_description,
+                    action_quantity, action_unit, product_name,
+                    estimated_cost_kes, urgency_score, urgency_level,
+                    urgency_breakdown, confidence_score, confidence_label,
+                    confidence_explanation, knowledge_layer, knowledge_layer_label,
+                    ph_gate_active, ph_gate_reason,
+                    calculation_breakdown, generated_at
+                ) VALUES (
+                    %s::uuid, %s::uuid, %s::uuid, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, NOW()
+                )
+            """, (
+                zone_id, farm_id,
+                rec.get("planting_id"),
+                rec.get("reading_uuid"),
+                rec.get("recommendation_type"),
+                rec.get("action_description"),
+                rec.get("action_quantity"),
+                rec.get("action_unit"),
+                rec.get("product_name"),
+                rec.get("estimated_cost_kes"),
+                rec.get("urgency_score"),
+                rec.get("urgency_level"),
+                json.dumps({"growth_stage": rec.get("growth_stage")}),
+                rec.get("confidence_score"),
+                rec.get("confidence_label"),
+                rec.get("confidence_explanation"),
+                rec.get("knowledge_layer", 1),
+                rec.get("knowledge_layer_label"),
+                rec.get("ph_gate_active", False),
+                rec.get("ph_gate_reason"),
+                json.dumps(rec.get("calculation_breakdown") or {}),
+            ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Recommendation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/farms/{farm_id}/recommendations")
+def get_pending_recommendations(farm_id: str):
+    """Get all pending (unapplied) recommendations for a farm, ordered by urgency."""
     try:
-        sync_result = edge_storage.sync_to_cloud()
-        return sync_result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Sync error: {str(e)}")
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
 
-@app.get("/api/edge/export")
-async def export_edge_data():
-    """Export edge data to JSON"""
+        cur.execute("""
+            SELECT * FROM pending_recommendations
+            WHERE farm_id = %s::uuid
+            ORDER BY urgency_score DESC
+        """, (farm_id,))
+
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        return {
+            "farm_id": farm_id,
+            "total": len(rows),
+            "critical": sum(1 for r in rows if r.get("urgency_level") == "CRITICAL"),
+            "high":     sum(1 for r in rows if r.get("urgency_level") == "HIGH"),
+            "recommendations": rows
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/recommendations/{recommendation_id}/apply")
+def mark_recommendation_applied(recommendation_id: str, body: RecommendationApply,
+                                  farm_id: str = Query(...)):
+    """Record whether a recommendation was applied by the farmer."""
     try:
-        export_path = edge_storage.export_to_json()
-        return {"export_path": export_path, "status": "success"}
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        applied_at = datetime.fromisoformat(body.applied_at) \
+            if body.applied_at else datetime.now()
+
+        cur.execute("""
+            UPDATE recommendations
+            SET was_applied = %s,
+                applied_at = %s,
+                farmer_feedback = %s
+            WHERE recommendation_id = %s::uuid AND farm_id = %s::uuid
+        """, (body.was_applied, applied_at, body.farmer_feedback,
+              recommendation_id, farm_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"status": "updated", "recommendation_id": recommendation_id}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Export error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/edge/status")
-async def get_edge_status():
-    """Get edge storage status"""
-    return edge_storage.get_sync_status()
 
-# Future weather API integration (commented out for future implementation)
-"""
-@app.get("/api/weather/forecast/{zone_id}")
-async def get_weather_forecast(zone_id: str):
-    # TODO: Implement weather API integration
-    # Plan to integrate with OpenWeatherMap or similar service
-    pass
+# =============================================================================
+# FARM MANAGEMENT
+# =============================================================================
 
-@app.post("/api/irrigation/weather-adjusted")
-async def weather_adjusted_irrigation(data: Dict):
-    # TODO: Implement weather-based irrigation adjustment
-    # Will use forecast data to modify irrigation schedules
-    pass
-"""
+@app.get("/farms/{farm_id}/summary")
+def get_farm_summary(farm_id: str):
+    """Get farm overview from farm_summary view."""
+    try:
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT * FROM farm_summary WHERE farm_id = %s::uuid
+        """, (farm_id,))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Farm not found")
+
+        return dict(row)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/farms/register")
+def register_farm(farm: FarmRegistration):
+    """Register a new farm. Returns farm_id for subsequent operations."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO farms (
+                farm_name, owner_name, owner_phone, county,
+                soil_type, rainfall_zone, altitude_m,
+                latitude_center, longitude_center,
+                assigned_rover_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'ROVER_01')
+            RETURNING farm_id
+        """, (
+            farm.farm_name, farm.owner_name, farm.owner_phone,
+            farm.county, farm.soil_type, farm.rainfall_zone,
+            farm.altitude_m, farm.latitude_center, farm.longitude_center
+        ))
+
+        row = cur.fetchone()
+        farm_id = str(row["farm_id"])
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        logger.info(f"Registered farm: {farm.farm_name} ({farm_id})")
+        return {"status": "registered", "farm_id": farm_id, "farm_name": farm.farm_name}
+
+    except Exception as e:
+        logger.error(f"Farm registration error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/zones/register")
+def register_zone(zone: ZoneRegistration):
+    """Register a zone within a farm."""
+    try:
+        conn = get_db()
+        set_farm_context(conn, zone.farm_id)
+        cur = conn.cursor()
+
+        # Build a minimal polygon around center point (2m × 2m approximation)
+        # Proper boundary capture happens via GPS drive in the field
+        lat, lon = zone.center_lat, zone.center_lon
+        delta = 0.00001  # ~1m at equator
+        polygon_wkt = (
+            f"POLYGON(("
+            f"{lon-delta} {lat-delta}, "
+            f"{lon+delta} {lat-delta}, "
+            f"{lon+delta} {lat+delta}, "
+            f"{lon-delta} {lat+delta}, "
+            f"{lon-delta} {lat-delta}"
+            f"))"
+        )
+
+        cur.execute("""
+            INSERT INTO zones (
+                farm_id, zone_label, center_lat, center_lon,
+                area_m2, soil_type, notes,
+                boundary_polygon
+            ) VALUES (
+                %s::uuid, %s, %s, %s, %s, %s, %s,
+                ST_GeomFromText(%s, 4326)
+            )
+            ON CONFLICT (farm_id, zone_label) DO NOTHING
+            RETURNING zone_id
+        """, (
+            zone.farm_id, zone.zone_label,
+            zone.center_lat, zone.center_lon,
+            zone.area_m2,
+            zone.soil_type,
+            zone.notes,
+            polygon_wkt
+        ))
+
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return {"status": "exists", "message": f"Zone {zone.zone_label} already registered"}
+
+        return {
+            "status": "registered",
+            "zone_id": str(row["zone_id"]),
+            "zone_label": zone.zone_label,
+            "farm_id": zone.farm_id
+        }
+
+    except Exception as e:
+        logger.error(f"Zone registration error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# GPS FARM DETECTION [2]
+# =============================================================================
+
+@app.get("/farms/detect")
+def detect_farm_from_gps(lat: float = Query(...), lon: float = Query(...)):
+    """
+    Given a GPS coordinate, find which farm the rover is currently on.
+    Uses PostGIS point-in-polygon containment. [2]
+    Called by rover on startup to identify farm automatically.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # No RLS needed here — we're searching across all farms
+        cur.execute("""
+            SELECT farm_id, farm_name, owner_name, county,
+                   soil_type, rainfall_zone, altitude_m,
+                   assigned_rover_id
+            FROM farms
+            WHERE is_active = true
+              AND ST_Contains(
+                    boundary_polygon,
+                    ST_SetSRID(ST_Point(%s, %s), 4326)
+                  )
+            LIMIT 1
+        """, (lon, lat))
+
+        row = cur.fetchone()
+
+        if not row:
+            # Also check if we're close to a farm center (fallback for farms without polygon)
+            cur.execute("""
+                SELECT farm_id, farm_name, owner_name, county,
+                       soil_type, rainfall_zone, altitude_m,
+                       latitude_center, longitude_center,
+                       ST_Distance(
+                           ST_SetSRID(ST_Point(longitude_center, latitude_center), 4326)::geography,
+                           ST_SetSRID(ST_Point(%s, %s), 4326)::geography
+                       ) AS distance_m
+                FROM farms
+                WHERE is_active = true
+                  AND latitude_center IS NOT NULL
+                ORDER BY distance_m
+                LIMIT 1
+            """, (lon, lat))
+            row = cur.fetchone()
+
+            if row and row.get("distance_m", 9999) > 500:
+                cur.close()
+                conn.close()
+                return {
+                    "farm_detected": False,
+                    "message": "GPS coordinates do not match any registered farm",
+                    "nearest_farm": dict(row) if row else None
+                }
+
+        cur.close()
+        conn.close()
+
+        if not row:
+            return {"farm_detected": False, "message": "No farms registered yet"}
+
+        result = dict(row)
+        result["farm_detected"] = True
+
+        logger.info(f"GPS detection: lat={lat}, lon={lon} → farm {result.get('farm_name')}")
+        return result
+
+    except Exception as e:
+        logger.error(f"GPS detection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# CROP & MARKET DATA
+# =============================================================================
+
+@app.get("/crops/varieties")
+def get_crop_varieties(crop_name: Optional[str] = None):
+    """List crop varieties from database."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        if crop_name:
+            cur.execute("""
+                SELECT variety_id, crop_name, variety_name, variety_code,
+                       ph_optimal_min, ph_optimal_max,
+                       nitrogen_optimal_ppm, phosphorus_optimal_ppm, potassium_optimal_ppm,
+                       moisture_optimal_min, moisture_optimal_max,
+                       kc_initial, kc_mid, kc_end, depletion_fraction_p,
+                       days_total, baseline_yield_kg_per_m2,
+                       market_price_kes_per_kg_min, market_price_kes_per_kg_max,
+                       altitude_range, nitrogen_fixing
+                FROM crop_varieties
+                WHERE LOWER(crop_name) = LOWER(%s)
+                ORDER BY variety_name
+            """, (crop_name,))
+        else:
+            cur.execute("""
+                SELECT crop_name, COUNT(*) as variety_count,
+                       STRING_AGG(variety_name, ', ') as varieties
+                FROM crop_varieties
+                GROUP BY crop_name
+                ORDER BY crop_name
+            """)
+
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return {"crops": rows, "count": len(rows)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/market/prices/{crop_name}")
+def get_market_price(crop_name: str):
+    """
+    Get latest market price for a crop from cached KAMIS data.
+    Falls back gracefully if data is stale. [4]
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT crop_name, price_kes_per_kg, price_date, source, market_name
+            FROM market_prices
+            WHERE LOWER(crop_name) = LOWER(%s)
+              AND is_current = true
+            ORDER BY price_date DESC
+            LIMIT 1
+        """, (crop_name,))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            # Fallback to hardcoded recent prices
+            fallback = {
+                "maize": 47, "beans": 105, "potatoes": 38,
+                "tomatoes": 55, "kale": 8
+            }
+            price = fallback.get(crop_name.lower(), 50)
+            return {
+                "crop_name": crop_name,
+                "price_kes_per_kg": price,
+                "source": "hardcoded_fallback",
+                "is_stale": True,
+                "note": "No KAMIS data available. Using approximate price."
+            }
+
+        result = dict(row)
+        # Check if price is older than 30 days
+        age_days = (date.today() - result["price_date"]).days if result.get("price_date") else 999
+        result["is_stale"] = age_days > 30
+        result["age_days"] = age_days
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# ROVER SCHEDULING
+# =============================================================================
+
+@app.get("/rover/schedule/{farm_id}")
+def get_rover_schedule(farm_id: str):
+    """
+    Get priority queue for rover visits to this farm.
+    Zones with stale readings and high staleness score appear first. [6]
+    """
+    try:
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        # Get zones ordered by staleness
+        cur.execute("""
+            SELECT
+                zcs.zone_id,
+                zcs.zone_label,
+                zcs.crop_name,
+                zcs.growth_stage,
+                zcs.hours_since_reading,
+                zcs.is_stale_npk_ph,
+                zcs.is_stale_moisture,
+                zcs.is_stale_temperature,
+                zcs.needs_urgent_reading,
+                zcs.last_reading_at,
+                -- Staleness score: higher = more urgent
+                CASE
+                    WHEN zcs.is_stale_npk_ph THEN zcs.hours_since_reading / 168.0
+                    WHEN zcs.is_stale_moisture THEN zcs.hours_since_reading / 24.0
+                    ELSE 0
+                END AS staleness_score
+            FROM zone_current_state zcs
+            WHERE zcs.farm_id = %s::uuid
+            ORDER BY staleness_score DESC, zcs.zone_label
+        """, (farm_id,))
+
+        zones = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        urgent = [z for z in zones if z.get("needs_urgent_reading")]
+        return {
+            "farm_id": farm_id,
+            "total_zones": len(zones),
+            "urgent_zones": len(urgent),
+            "schedule": zones
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# IRRIGATION ENDPOINT (direct calc without storing)
+# =============================================================================
+
+@app.post("/calculate/irrigation")
+def calculate_irrigation(
+    zone_id: str,
+    farm_id: str = Query(...),
+    crop_name: str = Query("maize"),
+    days_since_planting: int = Query(30)
+):
+    """
+    Quick irrigation calculation for a zone based on latest readings.
+    Does not store result — use /zones/{id}/recommend for full workflow.
+    """
+    try:
+        conn = get_db()
+        set_farm_context(conn, farm_id)
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT zcs.soil_moisture_pct, zcs.air_temperature_c,
+                   zcs.air_humidity_pct, z.soil_type, z.area_m2
+            FROM zone_current_state zcs
+            JOIN zones z ON zcs.zone_id = z.zone_id
+            WHERE zcs.zone_id = %s::uuid AND zcs.farm_id = %s::uuid
+        """, (zone_id, farm_id))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Zone not found")
+
+        zone_data = dict(row)
+        soil_type = zone_data.get("soil_type", "loam")
+        area = zone_data.get("area_m2", 4.0)
+
+        result = irrigation_engine.generate_irrigation_schedule(
+            zone_data=zone_data,
+            crop_name=crop_name,
+            days_since_planting=days_since_planting,
+            soil_type=soil_type,
+            zone_area_m2=area
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
-    print("Starting YieldVision Precision Farming Server...")
-    print(f"GPU Available: {GPU_AVAILABLE}")
-    print("Server will be available at: http://localhost:8000")
-    print("API Documentation: http://localhost:8000/docs")
-    
-    # Start edge storage auto-sync
-    edge_storage.start_auto_sync()
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "main_server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )

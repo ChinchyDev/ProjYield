@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Thin custom scrollbar */
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(178, 197, 178, 0.28);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(178, 197, 178, 0.5);
+  }
+
+  /* Electron: only title-bar area should be draggable */
+  body { -webkit-app-region: no-drag; user-select: none; }
+  input, textarea, select { user-select: text; }
+}
+
+@layer utilities {
+  /* Glass-morphism card */
+  .glass {
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+
+  /* Drag handle for custom title bar */
+  .drag-handle { -webkit-app-region: drag; }
+
+  /* Remove focus ring for mouse, keep for keyboard */
+  .no-focus-ring:focus { outline: none; }
+  .no-focus-ring:focus-visible {
+    outline: 2px solid rgba(107, 142, 78, 0.7);
+    outline-offset: 2px;
+  }
+
+  /* Smooth page transitions */
+  .screen-enter { animation: fadeUp 0.22s ease-out both; }
+}

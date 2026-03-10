@@ -1,438 +1,761 @@
 """
-YieldVision Precision Farming ML Models
-Zone-specific soil amendment, water, and seed recommendation models
+YieldVision Precision Models
+YieldSoil — soil amendment recommendations (NPK + pH correction)
+YieldSeed — crop variety suitability scoring
+
+Research sources:
+  NPK deficiency math:   IFDC Fertilizer Use by Crop in Kenya (2019)
+  pH correction:         KALRO Soil Acidity and Liming Handbook for Kenya (2023)
+  Fertilizer products:   IFDC Fertilizer Quality Assessment Kenya (2019)
+  Yield response:        FAO Plant Nutrition for Food Security, Bulletin 16
+  Crop suitability:      ECOCROP (FAO), KALRO Crop Variety Catalogue 2023
 """
 
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from xgboost import XGBRegressor
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from typing import Dict, List, Tuple
-import joblib
-import json
+import math
+import logging
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
-class PrecisionSoilModel:
-    """Zone-specific soil amendment recommendation model"""
-    
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# FERTILIZER PRODUCTS — real Kenyan market products
+# Source: IFDC Kenya 2019, Yara Kenya 2024, MEA Kenya 2024
+# =============================================================================
+FERTILIZER_PRODUCTS = {
+    "CAN": {
+        "n_pct": 26.0, "p_pct": 0.0, "k_pct": 0.0,
+        "price_kes_per_50kg": 2800,
+        "type": "nitrogen",
+        "use": "Top-dress nitrogen. Apply at vegetative stage.",
+        "source": "IFDC Kenya 2019, Yara Kenya 2024"
+    },
+    "Urea": {
+        "n_pct": 46.0, "p_pct": 0.0, "k_pct": 0.0,
+        "price_kes_per_50kg": 3200,
+        "type": "nitrogen",
+        "use": "High-N correction. Apply carefully — burning risk.",
+        "source": "IFDC Kenya 2019"
+    },
+    "DAP": {
+        "n_pct": 18.0, "p_pct": 46.0, "k_pct": 0.0,
+        "price_kes_per_50kg": 3800,
+        "type": "npk_blend",
+        "use": "Basal application at planting. High P for root development.",
+        "source": "IFDC Kenya 2019, Yara Kenya 2024"
+    },
+    "NPK 17:17:17": {
+        "n_pct": 17.0, "p_pct": 17.0, "k_pct": 17.0,
+        "price_kes_per_50kg": 3500,
+        "type": "npk_blend",
+        "use": "Balanced application when all three nutrients are deficient.",
+        "source": "MEA Kenya 2024"
+    },
+    "MOP": {
+        "n_pct": 0.0, "p_pct": 0.0, "k_pct": 60.0,
+        "price_kes_per_50kg": 3000,
+        "type": "potassium",
+        "use": "Potassium correction. Good for tuber crops (potatoes).",
+        "source": "IFDC Kenya 2019"
+    },
+    "Mavuno Planting": {
+        "n_pct": 10.0, "p_pct": 26.0, "k_pct": 10.0,
+        "price_kes_per_50kg": 3600,
+        "type": "npk_blend",
+        "use": "MEA planting fertilizer. Well-suited for Kenyan soils.",
+        "source": "MEA Kenya 2024"
+    },
+    "Mavuno Top": {
+        "n_pct": 25.0, "p_pct": 5.0, "k_pct": 5.0,
+        "price_kes_per_50kg": 3300,
+        "type": "npk_blend",
+        "use": "Top-dress at vegetative stage. Nitrogen-heavy for leaf growth.",
+        "source": "MEA Kenya 2024"
+    },
+    "Agricultural Lime": {
+        "n_pct": 0.0, "p_pct": 0.0, "k_pct": 0.0,
+        "caco3_pct": 85.0,
+        "price_kes_per_50kg": 800,
+        "type": "lime",
+        "use": "pH correction for acidic soils. Apply 3-6 months before planting.",
+        "source": "KALRO Liming Guide 2023"
+    },
+}
+
+# =============================================================================
+# SOIL TYPE LIME FACTORS
+# Source: KALRO Soil Acidity and Liming Handbook for Kenya (2023)
+# Tonnes of agricultural lime per hectare per pH unit to correct
+# =============================================================================
+LIME_FACTORS_TONNES_HA_PER_PH_UNIT = {
+    "sandy":      1.75,
+    "sandy_loam": 2.50,
+    "loam":       3.75,
+    "clay_loam":  5.25,
+    "clay":       7.00,
+}
+
+# Bulk density for unit conversions (g/cm3) — matches irrigation_engine
+BULK_DENSITY = {
+    "sandy": 1.65, "sandy_loam": 1.45, "loam": 1.25, "clay_loam": 1.15, "clay": 1.10
+}
+
+# =============================================================================
+# CROP VARIETY OPTIMAL RANGES
+# Loaded from DB at runtime; these are fallback Layer 1 values
+# Source: KALRO, IFDC, ECOCROP
+# =============================================================================
+CROP_OPTIMAL_RANGES = {
+    "maize": {
+        "ph_min": 5.5, "ph_max": 7.5, "ph_opt_min": 6.0, "ph_opt_max": 7.0,
+        "n_opt": 150, "p_opt": 60, "k_opt": 120,
+        "n_min": 80, "p_min": 30, "k_min": 80,
+        "moisture_opt_min": 50, "moisture_opt_max": 80,
+        "nitrogen_fixing": False,
+        "source": "KALRO, IFDC Kenya 2019"
+    },
+    "beans": {
+        "ph_min": 5.5, "ph_max": 7.0, "ph_opt_min": 6.0, "ph_opt_max": 6.8,
+        "n_opt": 60, "p_opt": 50, "k_opt": 80,
+        "n_min": 20, "p_min": 30, "k_min": 50,
+        "moisture_opt_min": 45, "moisture_opt_max": 75,
+        "nitrogen_fixing": True,   # rhizobia fix N — don't over-apply N fertilizer
+        "source": "KALRO Beans Programme 2023"
+    },
+    "potatoes": {
+        "ph_min": 5.0, "ph_max": 6.5, "ph_opt_min": 5.5, "ph_opt_max": 6.2,
+        "n_opt": 150, "p_opt": 80, "k_opt": 250,
+        "n_min": 80, "p_min": 50, "k_min": 150,
+        "moisture_opt_min": 55, "moisture_opt_max": 85,
+        "nitrogen_fixing": False,
+        "source": "KALRO Tigoni 2023, IFDC Kenya 2019"
+    },
+    "tomatoes": {
+        "ph_min": 5.8, "ph_max": 7.0, "ph_opt_min": 6.0, "ph_opt_max": 6.8,
+        "n_opt": 180, "p_opt": 80, "k_opt": 200,
+        "n_min": 100, "p_min": 50, "k_min": 120,
+        "moisture_opt_min": 60, "moisture_opt_max": 85,
+        "nitrogen_fixing": False,
+        "source": "Syngenta Kenya 2024, IFDC Kenya 2019"
+    },
+    "kale": {
+        "ph_min": 5.5, "ph_max": 7.5, "ph_opt_min": 6.0, "ph_opt_max": 7.0,
+        "n_opt": 160, "p_opt": 50, "k_opt": 130,
+        "n_min": 80, "p_min": 30, "k_min": 80,
+        "moisture_opt_min": 50, "moisture_opt_max": 80,
+        "nitrogen_fixing": False,
+        "source": "KALRO Horticulture 2023"
+    },
+}
+
+
+# =============================================================================
+# YIELD SOIL MODEL
+# =============================================================================
+
+class YieldSoilModel:
+    """
+    Soil amendment recommendation engine.
+    Translates sensor readings into specific product recommendations in KES.
+
+    No ML training required — Layer 1 knowledge uses published science directly.
+    ML layer added later once farm-specific data accumulates.
+    """
+
     def __init__(self):
-        self.model = XGBRegressor(
-            n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
-            random_state=42
-        )
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        
-        # Optimal NPK levels for different crops (ppm)
-        self.optimal_npk = {
-            'maize': {'N': 150, 'P': 50, 'K': 120},
-            'wheat': {'N': 120, 'P': 40, 'K': 100},
-            'tomatoes': {'N': 200, 'P': 60, 'K': 150},
-            'beans': {'N': 80, 'P': 50, 'K': 80},
-            'potatoes': {'N': 180, 'P': 70, 'K': 200}
-        }
-        
-        # Optimal pH ranges for different crops
-        self.optimal_ph = {
-            'maize': [6.0, 7.0],
-            'wheat': [6.0, 7.5],
-            'tomatoes': [6.0, 6.8],
-            'beans': [6.0, 7.0],
-            'potatoes': [5.0, 6.0]
-        }
-    
-    def calculate_optimal_npk(self, crop_type: str, soil_type: str) -> Dict[str, float]:
-        """Calculate optimal NPK for specific crop and soil type"""
-        base_npk = self.optimal_npk.get(crop_type, self.optimal_npk['maize'])
-        
-        # Adjust based on soil type
-        soil_adjustments = {
-            'sandy': {'N': 1.2, 'P': 1.1, 'K': 0.9},  # Leaching, need more N
-            'clay': {'N': 0.9, 'P': 1.2, 'K': 1.1},   # Better retention
-            'loamy': {'N': 1.0, 'P': 1.0, 'K': 1.0},   # Balanced
-            'silty': {'N': 1.1, 'P': 1.0, 'K': 1.0}    # Good drainage
-        }
-        
-        adjustment = soil_adjustments.get(soil_type, soil_adjustments['loamy'])
-        
+        self.fertilizers = FERTILIZER_PRODUCTS
+        self.lime_factors = LIME_FACTORS_TONNES_HA_PER_PH_UNIT
+        self.bulk_density = BULK_DENSITY
+        self.crop_ranges = CROP_OPTIMAL_RANGES
+
+    # -------------------------------------------------------------------------
+    # pH HARD GATE — checks before any NPK recommendation
+    # If pH is critically wrong, NPK is blocked. Farmer wastes money otherwise.
+    # Source: KALRO Liming Guide 2023
+    # -------------------------------------------------------------------------
+    def check_ph_gate(self, ph: float, crop_name: str) -> Dict:
+        """
+        pH hard gate — must pass before any NPK recommendation is generated.
+        If pH outside crop range by > 0.5 units, gate is ACTIVE and NPK blocked.
+
+        Returns:
+            Dict with gate_active bool, reason, and lime recommendation if active
+        """
+        crop = crop_name.lower()
+        ranges = self.crop_ranges.get(crop, self.crop_ranges["maize"])
+        ph_min = ranges["ph_min"]
+        ph_max = ranges["ph_max"]
+
+        too_low  = ph < (ph_min - 0.5)
+        too_high = ph > (ph_max + 0.5)
+
+        if not too_low and not too_high:
+            return {
+                "gate_active": False,
+                "ph_status": "acceptable",
+                "current_ph": ph,
+                "crop_ph_range": [ph_min, ph_max]
+            }
+
+        if too_low:
+            direction = "too acidic"
+            correction = "Add agricultural lime to raise pH"
+        else:
+            direction = "too alkaline"
+            correction = "Acidify with sulfur or organic matter"
+
         return {
-            'N': base_npk['N'] * adjustment['N'],
-            'P': base_npk['P'] * adjustment['P'],
-            'K': base_npk['K'] * adjustment['K']
-        }
-    
-    def calculate_ph_needs(self, current_ph: float, crop_type: str) -> float:
-        """Calculate pH adjustment needs in liters per zone"""
-        optimal_range = self.optimal_ph.get(crop_type, [6.0, 7.0])
-        
-        if current_ph < optimal_range[0]:
-            # Need to raise pH (add lime)
-            ph_deficit = optimal_range[0] - current_ph
-            lime_needed = ph_deficit * 2.0  # Simplified calculation
-            return lime_needed
-        elif current_ph > optimal_range[1]:
-            # Need to lower pH (add sulfur)
-            ph_excess = current_ph - optimal_range[1]
-            sulfur_needed = ph_excess * 1.5  # Simplified calculation
-            return -sulfur_needed  # Negative indicates lowering pH
-        
-        return 0.0  # pH is in optimal range
-    
-    def recommend_amendments(self, zone_data: Dict) -> Dict:
-        """Recommend precise amendments for a 2m² zone"""
-        current_npk = {
-            'N': zone_data.get('nitrogen_ppm', 0),
-            'P': zone_data.get('phosphorus_ppm', 0),
-            'K': zone_data.get('potassium_ppm', 0)
-        }
-        
-        crop_type = zone_data.get('crop_type', 'maize')
-        soil_type = zone_data.get('soil_type', 'loamy')
-        
-        # Calculate optimal levels for this zone
-        target_npk = self.calculate_optimal_npk(crop_type, soil_type)
-        
-        # Calculate exact deficit per zone (convert ppm to kg per 2m²)
-        zone_area_m2 = 4.0  # 2m x 2m
-        ppm_to_kg_per_m2 = 0.001  # Approximate conversion
-        
-        amendments = {
-            'zone_id': zone_data.get('zone_id'),
-            'nitrogen_kg_per_zone': max(0, (target_npk['N'] - current_npk['N']) * ppm_to_kg_per_m2 * zone_area_m2),
-            'phosphorus_kg_per_zone': max(0, (target_npk['P'] - current_npk['P']) * ppm_to_kg_per_m2 * zone_area_m2),
-            'potassium_kg_per_zone': max(0, (target_npk['K'] - current_npk['K']) * ppm_to_kg_per_m2 * zone_area_m2),
-            'ph_adjustment_liters_per_zone': self.calculate_ph_needs(
-                zone_data.get('ph_level', 7.0), crop_type
+            "gate_active": True,
+            "ph_status": direction,
+            "do_not_fertilize_until": True,
+            "reason": (
+                f"Soil pH {ph:.1f} is {direction} for {crop_name} "
+                f"(needs {ph_min}–{ph_max}). At this pH, applied fertilizer "
+                f"cannot be absorbed. Correct pH first."
             ),
-            'organic_matter_kg_per_zone': max(0, (3.0 - zone_data.get('organic_matter_percent', 0)) * zone_area_m2 * 0.01),
-            'estimated_cost_usd': 0.0  # Will be calculated based on local prices
+            "correction": correction,
+            "current_ph": ph,
+            "crop_ph_range": [ph_min, ph_max],
+            "source": "KALRO Liming Guide 2023"
         }
-        
-        # Calculate estimated cost (simplified pricing)
-        fertilizer_prices = {
-            'nitrogen_per_kg': 1.5,
-            'phosphorus_per_kg': 2.0,
-            'potassium_per_kg': 1.8,
-            'lime_per_liter': 0.5,
-            'sulfur_per_liter': 0.8,
-            'organic_matter_per_kg': 0.3
-        }
-        
-        amendments['estimated_cost_usd'] = (
-            amendments['nitrogen_kg_per_zone'] * fertilizer_prices['nitrogen_per_kg'] +
-            amendments['phosphorus_kg_per_zone'] * fertilizer_prices['phosphorus_per_kg'] +
-            amendments['potassium_kg_per_zone'] * fertilizer_prices['potassium_per_kg'] +
-            abs(amendments['ph_adjustment_liters_per_zone']) * 
-            (fertilizer_prices['lime_per_liter'] if amendments['ph_adjustment_liters_per_zone'] > 0 
-             else fertilizer_prices['sulfur_per_liter']) +
-            amendments['organic_matter_kg_per_zone'] * fertilizer_prices['organic_matter_per_kg']
-        )
-        
-        return amendments
-    
-    def train(self, X: np.ndarray, y: np.ndarray):
-        """Train the soil model"""
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.is_trained = True
-    
-    def predict(self, zone_data: Dict) -> float:
-        """Predict soil health score for a zone"""
-        if not self.is_trained:
-            return 0.75  # Default score if not trained
-        
-        features = np.array([[
-            zone_data.get('nitrogen_ppm', 0),
-            zone_data.get('phosphorus_ppm', 0),
-            zone_data.get('potassium_ppm', 0),
-            zone_data.get('ph_level', 7.0),
-            zone_data.get('organic_matter_percent', 2.0),
-            zone_data.get('soil_moisture_20cm', 30)
-        ]])
-        
-        features_scaled = self.scaler.transform(features)
-        return self.model.predict(features_scaled)[0]
 
-class PrecisionWaterModel(nn.Module):
-    """Neural network model for irrigation scheduling"""
-    
-    def __init__(self, input_size=8, hidden_size=32, num_layers=2):
-        super(PrecisionWaterModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # LSTM layers for time series analysis
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=0.2)
-        
-        # Fully connected layers for final prediction
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 16),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(16, 3)  # Output: water_amount, efficiency, stress_level
-        )
-        
-        # Crop-specific water requirements
-        self.crop_water_needs = {
-            'maize': {'base_requirement': 4.5, 'critical_stages': ['flowering', 'fruiting']},
-            'wheat': {'base_requirement': 3.8, 'critical_stages': ['flowering', 'grain_filling']},
-            'tomatoes': {'base_requirement': 5.2, 'critical_stages': ['flowering', 'fruiting']},
-            'beans': {'base_requirement': 3.2, 'critical_stages': ['flowering', 'pod_filling']},
-            'potatoes': {'base_requirement': 4.8, 'critical_stages': ['tuber_initiation', 'bulking']}
-        }
-    
-    def forward(self, x):
-        # Initialize hidden state
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        
-        # LSTM forward pass
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Use the last time step output
-        out = self.fc(out[:, -1, :])
-        return out
-    
-    def zone_irrigation_schedule(self, zone_id: str, current_moisture: float, 
-                               crop_stage: str, zone_data: Dict) -> Dict:
-        """Generate irrigation schedule for a specific zone"""
-        
-        crop_type = zone_data.get('crop_type', 'maize')
-        soil_type = zone_data.get('soil_type', 'loamy')
-        
-        # Get crop-specific requirements
-        crop_info = self.crop_water_needs.get(crop_type, self.crop_water_needs['maize'])
-        base_requirement = crop_info['base_requirement']
-        
-        # Adjust based on growth stage
-        if crop_stage in crop_info['critical_stages']:
-            stage_multiplier = 1.3
-        else:
-            stage_multiplier = 1.0
-        
-        # Soil type adjustments
-        soil_factors = {
-            'sandy': 1.2,    # Drains faster, needs more water
-            'clay': 0.8,     # Holds water well
-            'loamy': 1.0,    # Balanced
-            'silty': 1.1     # Good drainage
-        }
-        
-        soil_factor = soil_factors.get(soil_type, 1.0)
-        
-        # Calculate water amount for 4m² zone
-        moisture_deficit = max(0, 35.0 - current_moisture)  # Target 35% moisture
-        water_liters_per_hour = base_requirement * stage_multiplier * soil_factor * (moisture_deficit / 20.0)
-        
-        # Calculate irrigation duration
-        flow_rate_liters_per_hour = 2.0  # Typical drip irrigation flow rate
-        duration_minutes = (water_liters_per_hour / flow_rate_liters_per_hour) * 60
-        
-        # Calculate efficiency
-        efficiency_score = self.calculate_water_efficiency(current_moisture, zone_data)
-        
+    # -------------------------------------------------------------------------
+    # LIME REQUIREMENT CALCULATION
+    # Source: KALRO Soil Acidity and Liming Handbook for Kenya (2023)
+    # -------------------------------------------------------------------------
+    def calculate_lime_needed(
+        self,
+        current_ph: float,
+        target_ph: float,
+        soil_type: str,
+        zone_area_m2: float
+    ) -> Dict:
+        """
+        Calculate lime needed to raise pH to target.
+
+        Formula: lime_t_ha = (target_pH - current_pH) × lime_factor
+        Convert to kg for zone: kg = (t_ha × 1000) / 10000 × area_m2
+
+        Source: KALRO Soil Acidity and Liming Handbook for Kenya (2023)
+        """
+        ph_deficit = max(target_ph - current_ph, 0.0)
+        if ph_deficit <= 0:
+            return {"lime_needed_kg": 0.0, "already_at_target": True}
+
+        factor = self.lime_factors.get(soil_type, self.lime_factors["loam"])
+        tonnes_per_ha = ph_deficit * factor
+        kg_per_m2 = (tonnes_per_ha * 1000) / 10000
+        kg_for_zone = kg_per_m2 * zone_area_m2
+
+        # Cost
+        lime = self.fertilizers["Agricultural Lime"]
+        cost_kes = (kg_for_zone / 50) * lime["price_kes_per_50kg"]
+
         return {
-            'zone_id': zone_id,
-            'water_liters_per_hour': round(water_liters_per_hour, 2),
-            'duration_minutes': round(duration_minutes, 1),
-            'efficiency_score': round(efficiency_score, 3),
-            'optimal_time': self.calculate_optimal_irrigation_time(zone_data),
-            'soil_moisture_target': 35.0,  # Target moisture percentage
-            'estimated_cost_usd': round(water_liters_per_hour * 0.001, 3),  # $0.001 per liter
-            'roi_multiplier': round(efficiency_score * 2.5, 2)  # Simplified ROI calculation
+            "lime_needed_kg": round(kg_for_zone, 3),
+            "product": "Agricultural Lime",
+            "cost_kes": round(cost_kes, 2),
+            "formula": "lime_t/ha = (target_pH - current_pH) × lime_factor; kg = (t/ha × 1000 / 10000) × area_m2",
+            "inputs": {
+                "current_ph": current_ph,
+                "target_ph": target_ph,
+                "ph_deficit": round(ph_deficit, 2),
+                "soil_type": soil_type,
+                "lime_factor_t_ha_per_unit": factor,
+                "tonnes_per_ha": round(tonnes_per_ha, 3),
+                "zone_area_m2": zone_area_m2,
+            },
+            "source": "KALRO Soil Acidity and Liming Handbook for Kenya (2023)"
         }
-    
-    def calculate_water_efficiency(self, current_moisture: float, zone_data: Dict) -> float:
-        """Calculate water use efficiency for current conditions"""
-        target_moisture = 35.0
-        
-        if current_moisture >= target_moisture:
-            return 0.8  # Good efficiency when well-watered
-        
-        # Efficiency decreases when too dry
-        efficiency = 0.8 * (current_moisture / target_moisture)
-        return max(0.2, efficiency)
-    
-    def calculate_optimal_irrigation_time(self, zone_data: Dict) -> str:
-        """Calculate optimal irrigation time based on conditions"""
-        temperature = zone_data.get('temperature_c', 25.0)
-        
-        if temperature > 30:
-            return "05:00-07:00"  # Early morning for hot days
-        elif temperature < 20:
-            return "14:00-16:00"  # Afternoon for cool days
-        else:
-            return "06:00-08:00"  # Morning for moderate days
 
-class PrecisionSeedModel:
-    """Machine learning model for crop variety recommendation"""
-    
-    def __init__(self):
-        self.model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            random_state=42
-        )
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        
-        # Crop variety database with characteristics
-        self.crop_varieties = {
-            'maize': [
-                {'name': 'Hybrid 101', 'yield_potential': 9.2, 'drought_tolerance': 0.6, 'disease_resistance': 0.8, 'maturity_days': 115},
-                {'name': 'Hybrid 202', 'yield_potential': 10.1, 'drought_tolerance': 0.4, 'disease_resistance': 0.9, 'maturity_days': 120},
-                {'name': 'DroughtMaster', 'yield_potential': 8.5, 'drought_tolerance': 0.9, 'disease_resistance': 0.7, 'maturity_days': 110},
-                {'name': 'HighYield Pro', 'yield_potential': 11.2, 'drought_tolerance': 0.3, 'disease_resistance': 0.85, 'maturity_days': 125}
-            ],
-            'wheat': [
-                {'name': 'Hard Red Winter', 'yield_potential': 4.5, 'drought_tolerance': 0.7, 'disease_resistance': 0.8, 'maturity_days': 95},
-                {'name': 'Soft White', 'yield_potential': 4.1, 'drought_tolerance': 0.8, 'disease_resistance': 0.7, 'maturity_days': 90},
-                {'name': 'Durum Gold', 'yield_potential': 3.9, 'drought_tolerance': 0.6, 'disease_resistance': 0.9, 'maturity_days': 100}
-            ],
-            'tomatoes': [
-                {'name': 'Roma VF', 'yield_potential': 16.2, 'drought_tolerance': 0.5, 'disease_resistance': 0.8, 'maturity_days': 80},
-                {'name': 'Cherry Sweet', 'yield_potential': 14.5, 'drought_tolerance': 0.7, 'disease_resistance': 0.9, 'maturity_days': 75},
-                {'name': 'Beefsteak XL', 'yield_potential': 18.0, 'drought_tolerance': 0.4, 'disease_resistance': 0.7, 'maturity_days': 85}
-            ]
+    # -------------------------------------------------------------------------
+    # NPK DEFICIT CALCULATION
+    # Source: IFDC Fertilizer Use by Crop in Kenya (2019)
+    # CABI Soil Fertility in Africa
+    # -------------------------------------------------------------------------
+    def calculate_npk_deficit(
+        self,
+        current_n: float,
+        current_p: float,
+        current_k: float,
+        crop_name: str,
+        soil_type: str,
+        zone_area_m2: float,
+        root_depth_cm: float = 40.0
+    ) -> Dict:
+        """
+        Convert ppm deficit to kg of nutrient needed for this zone.
+
+        Formula: nutrient_kg = (optimal_ppm - current_ppm) × Bd × Zr_cm × area_m2 × 0.0001
+        Unit derivation: ppm × g/cm3 × cm × m2 → kg (×0.0001 is the unit conversion)
+        Source: CABI Soil Fertility in Africa, IFDC Kenya 2019
+
+        Args:
+            root_depth_cm: Effective root depth from crop_varieties table
+
+        Returns:
+            Dict with N, P, K deficits in kg and ppm
+        """
+        crop = crop_name.lower()
+        ranges = self.crop_ranges.get(crop, self.crop_ranges["maize"])
+        bd = self.bulk_density.get(soil_type, 1.25)
+
+        # Unit conversion: ppm × g/cm3 × cm depth × m2 area × 0.0001 = kg
+        # 0.0001 = (1/100) for % of ppm being fraction × (1/1000) g→kg × (1/10) cm→dm
+        def ppm_to_kg(ppm_deficit):
+            return ppm_deficit * bd * root_depth_cm * zone_area_m2 * 0.0001
+
+        n_deficit_ppm = max(ranges["n_opt"] - current_n, 0.0)
+        p_deficit_ppm = max(ranges["p_opt"] - current_p, 0.0)
+        k_deficit_ppm = max(ranges["k_opt"] - current_k, 0.0)
+
+        # Beans fix their own N — don't recommend N fertilizer unless severely deficient
+        if ranges.get("nitrogen_fixing") and n_deficit_ppm < 40:
+            n_deficit_ppm = 0.0
+
+        return {
+            "nitrogen_deficit_ppm":   round(n_deficit_ppm, 1),
+            "phosphorus_deficit_ppm": round(p_deficit_ppm, 1),
+            "potassium_deficit_ppm":  round(k_deficit_ppm, 1),
+            "nitrogen_deficit_kg":    round(ppm_to_kg(n_deficit_ppm), 4),
+            "phosphorus_deficit_kg":  round(ppm_to_kg(p_deficit_ppm), 4),
+            "potassium_deficit_kg":   round(ppm_to_kg(k_deficit_ppm), 4),
+            "nitrogen_fixing_crop":   ranges.get("nitrogen_fixing", False),
+            "formula": "nutrient_kg = deficit_ppm × Bd × root_depth_cm × area_m2 × 0.0001",
+            "inputs": {
+                "current_n_ppm": current_n, "optimal_n_ppm": ranges["n_opt"],
+                "current_p_ppm": current_p, "optimal_p_ppm": ranges["p_opt"],
+                "current_k_ppm": current_k, "optimal_k_ppm": ranges["k_opt"],
+                "bulk_density": bd,
+                "root_depth_cm": root_depth_cm,
+                "zone_area_m2": zone_area_m2,
+            },
+            "source": "CABI Soil Fertility in Africa; IFDC Fertilizer Use by Crop in Kenya 2019"
         }
-    
-    def microclimate_analysis(self, zone_data: Dict) -> Dict:
-        """Analyze microclimate and recommend suitable varieties"""
-        zone_id = zone_data.get('zone_id', 'unknown')
-        crop_type = zone_data.get('crop_type', 'maize')
-        
-        # Get available varieties for this crop
-        varieties = self.crop_varieties.get(crop_type, self.crop_varieties['maize'])
-        
-        # Analyze zone conditions
-        conditions = self.analyze_zone_conditions(zone_data)
-        
-        # Score each variety based on zone conditions
-        scored_varieties = []
-        for variety in varieties:
-            score = self.calculate_variety_score(variety, conditions)
-            scored_varieties.append({
-                'variety_name': variety['name'],
-                'suitability_score': round(score, 3),
-                'expected_yield_kg_per_zone': round(variety['yield_potential'] * score, 2),
-                'drought_tolerance': variety['drought_tolerance'],
-                'disease_resistance': variety['disease_resistance'],
-                'maturity_days': variety['maturity_days'],
-                'recommendation_reason': self.get_recommendation_reason(variety, conditions)
+
+    # -------------------------------------------------------------------------
+    # FERTILIZER PRODUCT RECOMMENDATION
+    # Translates kg of nutrient needed into a specific product + KES cost
+    # -------------------------------------------------------------------------
+    def recommend_fertilizer(
+        self,
+        nutrient: str,
+        kg_needed: float,
+        crop_name: str,
+        growth_stage: str = "mid"
+    ) -> Optional[Dict]:
+        """
+        Recommend the best matching Kenyan fertilizer product for a nutrient deficit.
+
+        Args:
+            nutrient: 'nitrogen', 'phosphorus', or 'potassium'
+            kg_needed: kg of the nutrient needed for this zone
+            crop_name: To match appropriate product
+            growth_stage: 'initial', 'development', 'mid', 'late'
+
+        Returns:
+            Dict with product_name, grams_to_apply, cost_kes, and action description
+        """
+        if kg_needed <= 0:
+            return None
+
+        # Select best product per nutrient and growth stage
+        # Priority logic based on KALRO/Yara recommendations for Kenya
+        if nutrient == "nitrogen":
+            if growth_stage in ("initial", "development"):
+                product_name = "DAP"         # DAP at planting for N+P
+            else:
+                product_name = "CAN"         # CAN for top-dressing
+
+        elif nutrient == "phosphorus":
+            product_name = "DAP"             # DAP is primary P source in Kenya
+
+        elif nutrient == "potassium":
+            crop = crop_name.lower()
+            if crop in ("potatoes", "tomatoes"):
+                product_name = "MOP"         # High K for tuber/fruit crops
+            else:
+                product_name = "NPK 17:17:17"
+
+        else:
+            return None
+
+        product = self.fertilizers.get(product_name)
+        if not product:
+            return None
+
+        # kg fertilizer needed = kg nutrient / (nutrient% / 100)
+        nutrient_pct_key = f"{nutrient[0]}_pct"  # n_pct, p_pct, k_pct
+        nutrient_pct = product.get(f"{nutrient[0]}_pct", 0)
+        if nutrient_pct <= 0:
+            return None
+
+        kg_product = kg_needed / (nutrient_pct / 100.0)
+        grams_product = kg_product * 1000
+
+        # Cost: price is per 50kg bag
+        cost_kes = (kg_product / 50.0) * product["price_kes_per_50kg"]
+
+        return {
+            "product_name": product_name,
+            "nutrient_targeted": nutrient,
+            "kg_product_needed": round(kg_product, 4),
+            "grams_to_apply": round(grams_product, 1),
+            "cost_kes": round(cost_kes, 2),
+            "product_n_pct": product.get("n_pct", 0),
+            "product_p_pct": product.get("p_pct", 0),
+            "product_k_pct": product.get("k_pct", 0),
+            "application_guide": product["use"],
+            "formula": "kg_product = kg_nutrient / (nutrient_pct / 100)",
+            "source": product["source"]
+        }
+
+    # -------------------------------------------------------------------------
+    # FULL SOIL RECOMMENDATION — combines gate + lime + NPK
+    # -------------------------------------------------------------------------
+    def generate_soil_recommendation(
+        self,
+        zone_data: Dict,
+        crop_name: str,
+        soil_type: str,
+        zone_area_m2: float = 4.0,
+        days_since_planting: int = 30,
+        growth_stage: str = "mid",
+        root_depth_cm: float = 40.0
+    ) -> Dict:
+        """
+        Generate complete soil amendment recommendations for one zone.
+
+        Flow:
+          1. Check pH gate — if critical, return only lime recommendation
+          2. Calculate lime needed (if pH suboptimal but not critical)
+          3. Calculate NPK deficits
+          4. Translate deficits to specific fertilizer products
+          5. Calculate total cost in KES
+          6. Assign urgency score
+
+        Args:
+            zone_data: Must include ph_level, nitrogen_ppm, phosphorus_ppm,
+                       potassium_ppm, electrical_conductivity, soil_moisture_pct
+        """
+        ph      = zone_data.get("ph_level", 6.5)
+        n_ppm   = zone_data.get("nitrogen_ppm", 100)
+        p_ppm   = zone_data.get("phosphorus_ppm", 50)
+        k_ppm   = zone_data.get("potassium_ppm", 100)
+        ec      = zone_data.get("electrical_conductivity", 300)
+
+        crop = crop_name.lower()
+        ranges = self.crop_ranges.get(crop, self.crop_ranges["maize"])
+
+        recommendations = []
+        total_cost_kes = 0.0
+
+        # --- Step 1: pH Gate ---
+        ph_gate = self.check_ph_gate(ph, crop_name)
+
+        if ph_gate["gate_active"]:
+            # pH is critical — only lime, no NPK
+            target_ph = ranges["ph_opt_min"]
+            lime = self.calculate_lime_needed(ph, target_ph, soil_type, zone_area_m2)
+            lime_rec = {
+                "recommendation_type": "lime",
+                "action_description": (
+                    f"pH is {ph:.1f} — too acidic for {crop_name}. "
+                    f"Apply {lime['lime_needed_kg']:.0f}g of Agricultural Lime. "
+                    f"Cost: ~KES {lime['cost_kes']:.0f}. "
+                    f"Wait 4–6 weeks before applying fertilizer."
+                ),
+                "action_quantity": lime["lime_needed_kg"],
+                "action_unit": "kg",
+                "product_name": "Agricultural Lime",
+                "estimated_cost_kes": lime["cost_kes"],
+                "urgency_level": "CRITICAL",
+                "ph_gate_active": True,
+                "ph_gate_reason": ph_gate["reason"],
+                "do_not_fertilize_until": True,
+                "calculation_breakdown": {
+                    "ph_gate": ph_gate,
+                    "lime_calc": lime,
+                    "data_sources": ["KALRO Soil Acidity and Liming Handbook Kenya 2023"]
+                }
+            }
+            return {
+                "ph_gate_active": True,
+                "recommendations": [lime_rec],
+                "total_cost_kes": lime["cost_kes"],
+                "summary": f"pH correction required before any fertilizer application."
+            }
+
+        # --- Step 2: Lime if pH is suboptimal (but not critical) ---
+        ph_opt_min = ranges["ph_opt_min"]
+        lime_recs = []
+        if ph < ph_opt_min:
+            target_ph = ph_opt_min
+            lime = self.calculate_lime_needed(ph, target_ph, soil_type, zone_area_m2)
+            if lime["lime_needed_kg"] > 0.001:
+                lime_recs.append({
+                    "recommendation_type": "lime",
+                    "action_description": (
+                        f"pH {ph:.1f} is below optimal ({ph_opt_min}). "
+                        f"Apply {lime['lime_needed_kg']*1000:.0f}g Agricultural Lime (~KES {lime['cost_kes']:.0f}). "
+                        f"Can apply alongside fertilizer but ideally 2 weeks apart."
+                    ),
+                    "action_quantity": lime["lime_needed_kg"],
+                    "action_unit": "kg",
+                    "product_name": "Agricultural Lime",
+                    "estimated_cost_kes": lime["cost_kes"],
+                    "urgency_level": "MEDIUM",
+                    "calculation_breakdown": {
+                        "lime_calc": lime,
+                        "data_sources": ["KALRO Liming Guide 2023"]
+                    }
+                })
+                total_cost_kes += lime["cost_kes"]
+
+        # --- Step 3: NPK deficits ---
+        npk = self.calculate_npk_deficit(
+            current_n=n_ppm, current_p=p_ppm, current_k=k_ppm,
+            crop_name=crop_name, soil_type=soil_type,
+            zone_area_m2=zone_area_m2, root_depth_cm=root_depth_cm
+        )
+
+        # --- Step 4: Fertilizer products for each deficit ---
+        npk_recs = []
+        for nutrient, deficit_ppm_key, deficit_kg_key in [
+            ("nitrogen",   "nitrogen_deficit_ppm",   "nitrogen_deficit_kg"),
+            ("phosphorus", "phosphorus_deficit_ppm", "phosphorus_deficit_kg"),
+            ("potassium",  "potassium_deficit_ppm",  "potassium_deficit_kg"),
+        ]:
+            deficit_ppm = npk[deficit_ppm_key]
+            deficit_kg  = npk[deficit_kg_key]
+
+            if deficit_ppm < 10:
+                continue  # Not worth recommending for tiny deficits
+
+            fert = self.recommend_fertilizer(nutrient, deficit_kg, crop_name, growth_stage)
+            if not fert:
+                continue
+
+            # Urgency based on deficit severity
+            if deficit_ppm > (ranges.get(f"{nutrient[0]}_opt", 100) * 0.5):
+                urgency = "HIGH"
+            elif deficit_ppm > (ranges.get(f"{nutrient[0]}_opt", 100) * 0.25):
+                urgency = "MEDIUM"
+            else:
+                urgency = "LOW"
+
+            action = (
+                f"Zone needs {nutrient}. Apply {fert['grams_to_apply']:.0f}g of "
+                f"{fert['product_name']} (~KES {fert['cost_kes']:.0f}). "
+                f"{fert['application_guide']}"
+            )
+
+            npk_recs.append({
+                "recommendation_type": f"fertilize_{nutrient[0]}",
+                "action_description": action,
+                "action_quantity": fert["grams_to_apply"],
+                "action_unit": "grams",
+                "product_name": fert["product_name"],
+                "estimated_cost_kes": fert["cost_kes"],
+                "urgency_level": urgency,
+                "calculation_breakdown": {
+                    "npk_deficit": npk,
+                    "fertilizer": fert,
+                    "data_sources": [
+                        "IFDC Fertilizer Use by Crop in Kenya 2019",
+                        "CABI Soil Fertility in Africa",
+                        npk["source"]
+                    ]
+                }
             })
-        
-        # Sort by suitability score
-        scored_varieties.sort(key=lambda x: x['suitability_score'], reverse=True)
-        
-        return {
-            'zone_id': zone_id,
-            'crop_type': crop_type,
-            'zone_conditions': conditions,
-            'recommended_varieties': scored_varieties[:3],  # Top 3 recommendations
-            'analysis_timestamp': pd.Timestamp.now().isoformat()
-        }
-    
-    def analyze_zone_conditions(self, zone_data: Dict) -> Dict:
-        """Analyze and categorize zone conditions"""
-        return {
-            'soil_moisture_level': self.categorize_moisture(zone_data.get('soil_moisture_20cm', 30)),
-            'temperature_range': self.categorize_temperature(zone_data.get('temperature_c', 25)),
-            'soil_fertility': self.categorize_fertility(zone_data),
-            'drainage_quality': zone_data.get('soil_type', 'loamy'),
-            'sun_exposure': 'full'  # Assuming full sun for most zones
-        }
-    
-    def categorize_moisture(self, moisture: float) -> str:
-        """Categorize soil moisture level"""
-        if moisture < 20:
-            return 'dry'
-        elif moisture < 35:
-            return 'moderate'
-        else:
-            return 'wet'
-    
-    def categorize_temperature(self, temp: float) -> str:
-        """Categorize temperature range"""
-        if temp < 15:
-            return 'cool'
-        elif temp < 25:
-            return 'moderate'
-        else:
-            return 'warm'
-    
-    def categorize_fertility(self, zone_data: Dict) -> str:
-        """Categorize soil fertility based on NPK levels"""
-        n = zone_data.get('nitrogen_ppm', 50)
-        p = zone_data.get('phosphorus_ppm', 30)
-        k = zone_data.get('potassium_ppm', 40)
-        
-        avg_npk = (n + p + k) / 3
-        
-        if avg_npk < 40:
-            return 'low'
-        elif avg_npk < 80:
-            return 'moderate'
-        else:
-            return 'high'
-    
-    def calculate_variety_score(self, variety: Dict, conditions: Dict) -> float:
-        """Calculate suitability score for a variety based on conditions"""
-        base_score = 0.5
-        
-        # Drought tolerance scoring
-        if conditions['soil_moisture_level'] == 'dry':
-            base_score += variety['drought_tolerance'] * 0.3
-        else:
-            base_score += (1 - variety['drought_tolerance']) * 0.1
-        
-        # Disease resistance scoring (always beneficial)
-        base_score += variety['disease_resistance'] * 0.2
-        
-        # Temperature compatibility
-        if conditions['temperature_range'] == 'warm' and variety['maturity_days'] < 110:
-            base_score += 0.1  # Early maturing varieties better in warm conditions
-        
-        # Yield potential (normalized)
-        max_yield = 20.0  # Maximum expected yield for normalization
-        yield_score = variety['yield_potential'] / max_yield
-        base_score += yield_score * 0.2
-        
-        return min(1.0, base_score)
-    
-    def get_recommendation_reason(self, variety: Dict, conditions: Dict) -> str:
-        """Generate explanation for variety recommendation"""
-        reasons = []
-        
-        if conditions['soil_moisture_level'] == 'dry' and variety['drought_tolerance'] > 0.7:
-            reasons.append("excellent drought tolerance")
-        
-        if variety['disease_resistance'] > 0.8:
-            reasons.append("strong disease resistance")
-        
-        if variety['yield_potential'] > 10:
-            reasons.append("high yield potential")
-        
-        if conditions['temperature_range'] == 'warm' and variety['maturity_days'] < 110:
-            reasons.append("early maturity for warm conditions")
-        
-        if not reasons:
-            reasons.append("well-balanced characteristics")
-        
-        return f"Selected for {', '.join(reasons)}"
-    
-    def train(self, X: np.ndarray, y: np.ndarray):
-        """Train the seed model"""
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
-        self.is_trained = True
+            total_cost_kes += fert["cost_kes"]
 
-# Global instances for use across the application
-soil_model = PrecisionSoilModel()
-water_model = PrecisionWaterModel()
-seed_model = PrecisionSeedModel()
+        all_recs = lime_recs + npk_recs
+
+        if not all_recs:
+            return {
+                "ph_gate_active": False,
+                "recommendations": [{
+                    "recommendation_type": "monitor",
+                    "action_description": "Soil levels are within acceptable ranges. No amendments needed this week.",
+                    "urgency_level": "LOW",
+                    "estimated_cost_kes": 0
+                }],
+                "total_cost_kes": 0.0,
+                "summary": "No soil amendments required."
+            }
+
+        return {
+            "ph_gate_active": False,
+            "recommendations": all_recs,
+            "total_cost_kes": round(total_cost_kes, 2),
+            "npk_summary": {
+                "n_deficit_ppm": npk["nitrogen_deficit_ppm"],
+                "p_deficit_ppm": npk["phosphorus_deficit_ppm"],
+                "k_deficit_ppm": npk["potassium_deficit_ppm"],
+            },
+            "summary": f"{len(all_recs)} amendment(s) recommended. Total cost: KES {total_cost_kes:.0f}"
+        }
+
+
+# =============================================================================
+# YIELD SEED MODEL
+# =============================================================================
+
+class YieldSeedModel:
+    """
+    Crop variety suitability scoring.
+    Scores each available variety against current zone conditions.
+    Source: ECOCROP (FAO), KALRO Crop Variety Catalogue 2023
+    """
+
+    def __init__(self):
+        self.crop_ranges = CROP_OPTIMAL_RANGES
+
+        # Kenyan variety baseline yields (kg/m2) and market prices
+        # Source: KALRO 2023, KAMIS market data
+        self.variety_data = {
+            "maize": [
+                {"name": "H614D",  "yield_kg_m2": 0.10, "days": 130, "altitude": "900-2100m", "drought_tolerant": False},
+                {"name": "DK8031", "yield_kg_m2": 0.125,"days": 115, "altitude": "0-1800m",   "drought_tolerant": False},
+                {"name": "DUMA 43","yield_kg_m2": 0.085,"days": 95,  "altitude": "0-1600m",   "drought_tolerant": True},
+            ],
+            "beans": [
+                {"name": "Rosecoco GLP2","yield_kg_m2": 0.050,"days": 80, "altitude": "1200-2200m","drought_tolerant": False},
+                {"name": "Mwezi Moja",  "yield_kg_m2": 0.045,"days": 65, "altitude": "0-1800m",   "drought_tolerant": True},
+            ],
+            "potatoes": [
+                {"name": "Shangi",      "yield_kg_m2": 0.40, "days": 95,  "altitude": "1800-3000m","drought_tolerant": False},
+                {"name": "Dutch Robjin","yield_kg_m2": 0.50, "days": 105, "altitude": "1800-3000m","drought_tolerant": False},
+            ],
+            "tomatoes": [
+                {"name": "Rambo F1",   "yield_kg_m2": 1.15, "days": 80,  "altitude": "0-2000m", "drought_tolerant": False},
+                {"name": "Money Maker","yield_kg_m2": 0.70, "days": 90,  "altitude": "0-2200m", "drought_tolerant": True},
+            ],
+            "kale": [
+                {"name": "Collard Mfalme F1","yield_kg_m2": 0.10, "days": 55, "altitude": "0-2500m","drought_tolerant": True},
+            ],
+        }
+
+    def score_variety(
+        self,
+        variety: Dict,
+        zone_data: Dict,
+        crop_name: str,
+        altitude_m: float = 1500.0,
+        rainfall_zone: str = "medium"
+    ) -> Dict:
+        """
+        Score a single variety 0–100 based on how well the zone suits it.
+        Uses Mitscherlich yield response principle — yield decreases as
+        conditions deviate from optimal.
+        Source: FAO Plant Nutrition for Food Security Bulletin 16
+        """
+        crop = crop_name.lower()
+        ranges = self.crop_ranges.get(crop, self.crop_ranges["maize"])
+        score = 100.0
+        penalties = []
+
+        ph = zone_data.get("ph_level", 6.5)
+        moisture = zone_data.get("soil_moisture_pct", 60.0)
+
+        # pH scoring
+        if ranges["ph_opt_min"] <= ph <= ranges["ph_opt_max"]:
+            pass  # perfect
+        elif ranges["ph_min"] <= ph <= ranges["ph_max"]:
+            deviation = min(abs(ph - ranges["ph_opt_min"]), abs(ph - ranges["ph_opt_max"]))
+            penalty = deviation * 10
+            score -= penalty
+            penalties.append(f"pH {ph:.1f} slightly outside optimal range (-{penalty:.0f}pts)")
+        else:
+            score -= 40
+            penalties.append(f"pH {ph:.1f} outside viable range (-40pts)")
+
+        # Moisture scoring
+        if ranges["moisture_opt_min"] <= moisture <= ranges["moisture_opt_max"]:
+            pass
+        else:
+            deviation = max(
+                ranges["moisture_opt_min"] - moisture,
+                moisture - ranges["moisture_opt_max"],
+                0
+            )
+            penalty = min(deviation * 0.5, 20)
+            score -= penalty
+            penalties.append(f"Moisture {moisture:.0f}% not ideal (-{penalty:.0f}pts)")
+
+        # Drought tolerance bonus when rainfall is low
+        if rainfall_zone == "low" and variety.get("drought_tolerant"):
+            score += 10
+            penalties.append("Drought tolerance bonus (+10pts)")
+
+        # Altitude suitability (rough check)
+        alt_range = variety.get("altitude", "0-3000m")
+        try:
+            parts = alt_range.replace("m", "").split("-")
+            alt_min, alt_max = float(parts[0]), float(parts[1])
+            if not (alt_min <= altitude_m <= alt_max):
+                score -= 20
+                penalties.append(f"Altitude {altitude_m:.0f}m outside variety range {alt_range} (-20pts)")
+        except Exception:
+            pass
+
+        score = max(0.0, min(100.0, score))
+
+        return {
+            "variety_name": variety["name"],
+            "suitability_score": round(score, 1),
+            "baseline_yield_kg_m2": variety["yield_kg_m2"],
+            "days_to_harvest": variety["days"],
+            "drought_tolerant": variety.get("drought_tolerant", False),
+            "penalties": penalties,
+            "source": "ECOCROP (FAO), KALRO Variety Catalogue 2023"
+        }
+
+    def recommend_variety(
+        self,
+        crop_name: str,
+        zone_data: Dict,
+        altitude_m: float = 1500.0,
+        rainfall_zone: str = "medium"
+    ) -> Dict:
+        """
+        Score all varieties for a crop and return ranked recommendations.
+        """
+        crop = crop_name.lower()
+        varieties = self.variety_data.get(crop, [])
+
+        if not varieties:
+            return {
+                "crop": crop_name,
+                "error": f"No variety data for {crop_name}",
+                "recommendations": []
+            }
+
+        scored = []
+        for v in varieties:
+            scored.append(self.score_variety(v, zone_data, crop_name, altitude_m, rainfall_zone))
+
+        scored.sort(key=lambda x: x["suitability_score"], reverse=True)
+        best = scored[0]
+
+        return {
+            "crop": crop_name,
+            "recommended_variety": best["variety_name"],
+            "suitability_score": best["suitability_score"],
+            "all_varieties_ranked": scored,
+            "confidence_label": (
+                "High confidence" if best["suitability_score"] >= 80
+                else "Moderate confidence" if best["suitability_score"] >= 60
+                else "Low confidence — consider improving soil conditions first"
+            ),
+            "source": "ECOCROP (FAO), KALRO Crop Variety Catalogue 2023"
+        }
+
+
+# =============================================================================
+# MODULE-LEVEL SINGLETONS
+# =============================================================================
+soil_model = YieldSoilModel()
+seed_model = YieldSeedModel()
