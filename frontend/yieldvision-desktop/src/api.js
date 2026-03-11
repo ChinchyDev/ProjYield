@@ -296,9 +296,45 @@ export const applyRecommendation = (recId, farmId, wasApplied, feedback = "") =>
   });
 
 
-// ─── Rover ───────────────────────────────────────────────────────────────────
+// ─── Rover schedule (via FastAPI) ────────────────────────────────────────────
 
 export const getRoverSchedule = (farmId) => request(`/rover/schedule/${farmId}`);
+
+// ─── Rover direct control (talks to ESP8266 AP at 192.168.4.1) ──────────────
+// The ESP8266 creates its own WiFi hotspot "YieldVision".
+// Laptop connects to that hotspot, then fetches these URLs directly.
+// CORS headers are already added by the ESP8266 firmware.
+//
+// Commands:  W=forward  S=backward  A=left  D=right
+//            B=burnout  C=circle    R=scan  ' '=stop
+
+export async function roverCommand(dir, ip = "192.168.4.1") {
+  if (useMock) {
+    return { ok: true, mock: true, command: dir };
+  }
+  try {
+    const res = await fetch(`http://${ip}/cmd?dir=${encodeURIComponent(dir)}`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    return { ok: res.ok, command: dir };
+  } catch (e) {
+    return { ok: false, error: e.message, command: dir };
+  }
+}
+
+export async function roverStatus(ip = "192.168.4.1") {
+  if (useMock) {
+    return {
+      status: "ok", ssid: "YieldVision", ip: "192.168.4.1",
+      last_cmd: "W", clients: 1, mock: true,
+    };
+  }
+  const res = await fetch(`http://${ip}/status`, {
+    signal: AbortSignal.timeout(2000),
+  });
+  if (!res.ok) throw new Error("ESP8266 status request failed");
+  return res.json();
+}
 
 
 // ─── Crops ───────────────────────────────────────────────────────────────────

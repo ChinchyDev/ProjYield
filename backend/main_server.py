@@ -878,6 +878,61 @@ def get_rover_schedule(farm_id: str):
 
 
 # =============================================================================
+# ROVER COMMAND RELAY
+# =============================================================================
+# The ESP8266 on the rover creates its own WiFi AP ("YieldVision", 192.168.4.1).
+# The laptop connects to that hotspot. The React UI can talk directly to the
+# ESP8266, but this relay endpoint lets the server act as a proxy — useful
+# for debugging or if CORS/network issues arise in production.
+
+import requests as _requests  # stdlib alias to avoid shadowing FastAPI's Request
+
+class RoverCommandRelay(BaseModel):
+    direction: str      # W/S/A/D/B/C or space for stop
+    rover_ip:  str = "192.168.4.1"
+
+@app.post("/rover/command")
+def relay_rover_command(body: RoverCommandRelay):
+    """
+    Relay a movement command to the rover's ESP8266 WiFi module.
+    The ESP8266 forwards the character to the Arduino Mega via Serial1.
+    Commands: W=forward S=backward A=left D=right B=burnout C=circle SPACE=stop R=scan
+    """
+    allowed = set("WSADwsadbcBCrR ")
+    if not body.direction or body.direction[0] not in allowed:
+        raise HTTPException(status_code=400, detail=f"Invalid command: '{body.direction}'")
+
+    cmd = body.direction[0]
+    url = f"http://{body.rover_ip}/cmd?dir={cmd}"
+    try:
+        resp = _requests.get(url, timeout=2.0)
+        return {
+            "status":   "sent",
+            "command":  cmd,
+            "rover_ip": body.rover_ip,
+            "rover_ack": resp.text.strip()
+        }
+    except _requests.exceptions.Timeout:
+        raise HTTPException(status_code=503, detail=f"Rover at {body.rover_ip} did not respond (timeout)")
+    except _requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach rover at {body.rover_ip} — check WiFi connection")
+
+
+@app.get("/rover/ping")
+def ping_rover(ip: str = "192.168.4.1"):
+    """
+    Check if the ESP8266 rover module is reachable and return its status JSON.
+    React UI polls this to show the connection indicator.
+    """
+    try:
+        resp = _requests.get(f"http://{ip}/status", timeout=2.0)
+        data = resp.json()
+        return {"reachable": True, "rover_ip": ip, **data}
+    except Exception:
+        return {"reachable": False, "rover_ip": ip}
+
+
+# =============================================================================
 # IRRIGATION ENDPOINT (direct calc without storing)
 # =============================================================================
 

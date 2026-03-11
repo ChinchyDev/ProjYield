@@ -5,17 +5,19 @@ import {
   mdiWeatherNight,
   mdiLogout,
   mdiLeaf,
+  mdiRobotMower,
 } from "@mdi/js";
 
 import { LIGHT, DARK }              from "./theme";
 import { getPendingRecommendations } from "./api";
 
-import BottomNav        from "./components/BottomNav";
-import OnboardingScreen from "./screens/OnboardingScreen";
-import HomeScreen       from "./screens/HomeScreen";
-import FarmScreen       from "./screens/FarmScreen";
-import TasksScreen      from "./screens/TasksScreen";
-import AlertsScreen     from "./screens/AlertsScreen";
+import BottomNav           from "./components/BottomNav";
+import RoverControlPanel   from "./components/RoverControlPanel";
+import OnboardingScreen    from "./screens/OnboardingScreen";
+import HomeScreen          from "./screens/HomeScreen";
+import FarmScreen          from "./screens/FarmScreen";
+import TasksScreen         from "./screens/TasksScreen";
+import AlertsScreen        from "./screens/AlertsScreen";
 
 export default function App() {
   // ── Theme ────────────────────────────────────────────────────────────────
@@ -49,6 +51,9 @@ export default function App() {
 
   // ── Navigation ───────────────────────────────────────────────────────────
   const [tab, setTab] = useState("home");
+
+  // ── Rover control panel ───────────────────────────────────────────────────
+  const [roverOpen, setRoverOpen] = useState(false);
 
   // ── Alert badge ──────────────────────────────────────────────────────────
   const [alertCount, setAlertCount] = useState(0);
@@ -128,6 +133,24 @@ export default function App() {
 
         {/* Controls */}
         <div className="flex items-center gap-1">
+          {/* Rover control toggle */}
+          <button
+            onClick={() => setRoverOpen(prev => !prev)}
+            className="flex items-center justify-center rounded-xl transition-opacity hover:opacity-80 no-focus-ring"
+            style={{
+              width: "32px", height: "32px",
+              background: roverOpen ? t.accent : t.bgHover,
+            }}
+            aria-label="Toggle rover control"
+            title="Rover Control"
+          >
+            <Icon
+              path={mdiRobotMower}
+              size={0.62}
+              color={roverOpen ? t.accentText : t.textSub}
+            />
+          </button>
+
           <button
             onClick={toggleTheme}
             className="flex items-center justify-center rounded-xl transition-opacity hover:opacity-70 no-focus-ring"
@@ -151,6 +174,14 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* ── Rover control panel — slides in below header ─────────────────── */}
+      {roverOpen && (
+        <RoverControlPanel
+          t={t}
+          onClose={() => setRoverOpen(false)}
+        />
+      )}
 
       {/* ── Screen content ──────────────────────────────────────────────── */}
       <main className="flex-1 overflow-hidden relative">
