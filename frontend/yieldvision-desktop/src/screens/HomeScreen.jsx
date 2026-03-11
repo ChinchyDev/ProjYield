@@ -175,34 +175,39 @@ export default function HomeScreen({ session, t, onNavigate }) {
             {/* ── LEFT: critical banner + zone cards ───────────────── */}
             <div style={{ flex: 1, minWidth: 0 }}>
 
-              {/* Critical alert banner */}
+              {/* Critical alert strip — compact, not full-width stretching */}
               {criticalZones.length > 0 && (
-                <button
-                  onClick={() => onNavigate?.("alerts")}
-                  className="no-focus-ring w-full"
-                  style={{
-                    display: "flex", alignItems: "center", gap: 12,
-                    background: "#E53935",
-                    boxShadow: "0 4px 18px rgba(229,57,53,0.40)",
-                    borderRadius: 16, padding: "12px 16px",
-                    marginBottom: 16, cursor: "pointer", border: "none", textAlign: "left", width: "100%",
-                  }}
-                >
-                  <Icon path={mdiAlertCircle} size={0.9} color="#fff" />
-                  <div style={{ flex: 1 }}>
-                    <p style={{ color: "#fff", fontWeight: 700, fontSize: "0.88rem", margin: 0 }}>
-                      {criticalZones.length === 1
-                        ? `Zone ${criticalZones[0].zone_id} needs action now`
-                        : `${criticalZones.length} zones need urgent attention`}
-                    </p>
-                    <p style={{ color: "rgba(255,255,255,0.82)", fontSize: "0.73rem", marginTop: 2 }}>
-                      {criticalZones[0].soil_moisture_20cm != null
-                        ? `Soil critically dry — ${criticalZones[0].soil_moisture_20cm}% moisture`
-                        : "Tap to view recommendations"}
-                    </p>
-                  </div>
-                  <Icon path={mdiArrowRight} size={0.7} color="rgba(255,255,255,0.65)" />
-                </button>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 14 }}>
+                  {criticalZones.map(z => (
+                    <button
+                      key={z.zone_id}
+                      onClick={() => onNavigate?.("alerts")}
+                      className="no-focus-ring"
+                      style={{
+                        display: "inline-flex", alignItems: "center", gap: 7,
+                        background: "#E5393522",
+                        border: "1.5px solid #E5393560",
+                        borderLeft: "4px solid #E53935",
+                        borderRadius: 12, padding: "8px 12px",
+                        cursor: "pointer", textAlign: "left",
+                      }}
+                    >
+                      <Icon path={mdiAlertCircle} size={0.65} color="#E53935" />
+                      <div>
+                        <p style={{ color: "#E53935", fontWeight: 700, fontSize: "0.78rem", margin: 0 }}>
+                          Zone {z.zone_id} — action needed
+                        </p>
+                        <p style={{ color: t.textSub, fontSize: "0.68rem", margin: 0, marginTop: 1 }}>
+                          {z.soil_moisture_20cm != null
+                            ? `${z.soil_moisture_20cm}% moisture`
+                            : "Critical condition"}
+                          {z.yield_estimate ? ` · ${z.yield_estimate.current_kg_ha} kg/ha est.` : ""}
+                        </p>
+                      </div>
+                      <Icon path={mdiArrowRight} size={0.55} color="#E5393580" style={{ marginLeft: 4 }} />
+                    </button>
+                  ))}
+                </div>
               )}
 
               {/* Zone grid header */}
@@ -285,14 +290,35 @@ export default function HomeScreen({ session, t, onNavigate }) {
 
                       {/* Card body */}
                       <div style={{ padding: "10px 12px 12px" }}>
-                        <span style={{
-                          display: "inline-block",
-                          background: col + "28", color: col,
-                          fontSize: "0.63rem", fontWeight: 700,
-                          borderRadius: 999, padding: "2px 8px", marginBottom: 8,
-                        }}>
-                          {statusLabel(st)}
-                        </span>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 7 }}>
+                          <span style={{
+                            display: "inline-block",
+                            background: col + "28", color: col,
+                            fontSize: "0.63rem", fontWeight: 700,
+                            borderRadius: 999, padding: "2px 8px",
+                          }}>
+                            {statusLabel(st)}
+                          </span>
+                          {zone.yield_estimate && (
+                            <span style={{ fontSize: "0.63rem", color: t.textMuted, fontWeight: 600 }}>
+                              {zone.yield_estimate.current_kg_ha.toLocaleString()} kg/ha
+                            </span>
+                          )}
+                        </div>
+                        {zone.yield_estimate && (
+                          <div style={{ marginBottom: 7 }}>
+                            <div style={{ height: 3, borderRadius: 99, background: t.border }}>
+                              <div style={{
+                                height: "100%", borderRadius: 99,
+                                background: col,
+                                width: `${Math.min(100, (zone.yield_estimate.current_kg_ha / zone.yield_estimate.potential_kg_ha) * 100).toFixed(0)}%`,
+                              }} />
+                            </div>
+                            <p style={{ fontSize: "0.6rem", color: t.textMuted, margin: "3px 0 0", lineHeight: 1 }}>
+                              of {zone.yield_estimate.potential_kg_ha.toLocaleString()} kg/ha potential
+                            </p>
+                          </div>
+                        )}
                         <div style={{ display: "flex", gap: 12 }}>
                           {zone.soil_moisture_20cm != null && (
                             <MetricChip icon={mdiWater} value={`${zone.soil_moisture_20cm}%`} t={t} />

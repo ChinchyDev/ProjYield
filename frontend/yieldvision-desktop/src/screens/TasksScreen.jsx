@@ -13,6 +13,9 @@ import {
   mdiFlask,
   mdiThermometer,
   mdiPh,
+  mdiSprout,
+  mdiTrendingUp,
+  mdiTrendingDown,
 } from "@mdi/js";
 import { getPendingRecommendations, applyRecommendation, getFarmSummary } from "../api";
 import { sortByUrgency } from "../utils/health";
@@ -28,11 +31,9 @@ const URGENCY_ICON = {
   LOW:      mdiClipboardCheckOutline,
 };
 
-const TABS = ["Tasks", "Reports"];
 const FILTERS = ["All", "Pending", "Done"];
 
 export default function TasksScreen({ farmId, t, onRefreshAlerts }) {
-  const [mainTab, setMainTab] = useState("Tasks");
   const [tasks,   setTasks]   = useState([]);
   const [zones,   setZones]   = useState([]);
   const [loading, setLoading] = useState(true);
@@ -83,199 +84,226 @@ export default function TasksScreen({ farmId, t, onRefreshAlerts }) {
   const pending = tasks.filter(tk => tk.status === "pending").length;
   const done    = tasks.filter(tk => tk.status === "applied" || tk.status === "skipped").length;
 
-  return (
-    <div className="h-full flex flex-col" style={{ paddingBottom: "90px" }}>
-      {/* ── Top tab bar: Tasks / Reports ────────────────────────────────── */}
-      <div
-        className="flex-shrink-0 px-6 pt-5 pb-0"
-        style={{ borderBottom: `1px solid ${t.border}` }}
-      >
-        <div className="flex items-end justify-between mb-3">
-          <div>
-            <h1 className="text-xl font-bold" style={{ color: t.textPrimary }}>
-              {mainTab === "Tasks" ? "Today's Tasks" : "Farm Reports"}
-            </h1>
-            {mainTab === "Tasks" && (
-              <p className="text-sm mt-0.5" style={{ color: t.textSub }}>
-                {pending} pending · {done} done
-              </p>
-            )}
-          </div>
-        </div>
+  if (loading) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <Spinner t={t} />
+      </div>
+    );
+  }
 
-        <div className="flex gap-1">
-          {TABS.map(tab => (
+  return (
+    <div
+      className="h-full overflow-hidden"
+      style={{
+        display: "grid",
+        gridTemplateColumns: "minmax(320px, 420px) 1fr",
+        gridTemplateRows: "auto 1fr",
+        paddingBottom: 90,
+      }}
+    >
+      {/* ── LEFT header ─────────────────────────────────────────────────── */}
+      <div
+        className="flex-shrink-0 px-5 pt-5 pb-3"
+        style={{ borderBottom: `1px solid ${t.border}`, borderRight: `1px solid ${t.border}` }}
+      >
+        <div className="flex items-center gap-2 mb-1">
+          <Icon path={mdiClipboardCheckOutline} size={0.75} color={t.accent} />
+          <h1 className="text-lg font-bold" style={{ color: t.textPrimary }}>Tasks</h1>
+        </div>
+        <p className="text-xs mb-3" style={{ color: t.textSub }}>{pending} pending · {done} done</p>
+        <div className="flex gap-1.5">
+          {FILTERS.map(f => (
             <button
-              key={tab}
-              onClick={() => setMainTab(tab)}
-              className="no-focus-ring px-4 py-2 text-sm font-semibold transition-all"
+              key={f}
+              onClick={() => setFilter(f)}
+              className="rounded-full px-3 py-1 text-xs font-semibold no-focus-ring"
               style={{
-                borderBottom: mainTab === tab ? `2px solid ${t.accent}` : "2px solid transparent",
-                color: mainTab === tab ? t.accent : t.textSub,
-                background: "transparent",
-                border: "none",
-                cursor: "pointer",
+                background: filter === f ? t.accent     : t.panelLight,
+                color:      filter === f ? t.accentText : t.textSub,
+                border: "none", cursor: "pointer",
               }}
             >
-              <Icon
-                path={tab === "Tasks" ? mdiClipboardCheckOutline : mdiChartBar}
-                size={0.55}
-                style={{ display: "inline", marginRight: 5, verticalAlign: "middle" }}
-                color={mainTab === tab ? t.accent : t.textSub}
-              />
-              {tab}
+              {f}
             </button>
           ))}
-
-          {/* filter pills — only in Tasks tab */}
-          {mainTab === "Tasks" && (
-            <div className="flex gap-2 ml-4">
-              {FILTERS.map(f => (
-                <button
-                  key={f}
-                  onClick={() => setFilter(f)}
-                  className="rounded-full px-3 py-1 text-xs font-semibold transition-all no-focus-ring"
-                  style={{
-                    background: filter === f ? t.accent     : t.panelLight,
-                    color:      filter === f ? t.accentText : t.textSub,
-                    border: "none", cursor: "pointer",
-                  }}
-                >
-                  {f}
-                </button>
-              ))}
-            </div>
-          )}
         </div>
       </div>
 
-      {/* ── Body ────────────────────────────────────────────────────────── */}
-      {loading ? (
-        <div className="flex-1 flex items-center justify-center"><Spinner t={t} /></div>
-      ) : mainTab === "Tasks" ? (
-        <TaskList
-          visible={visible} filter={filter} acting={acting}
-          handleApply={handleApply} t={t}
-        />
-      ) : (
-        <ReportsPanel zones={zones} tasks={tasks} t={t} />
-      )}
-    </div>
-  );
-}
-
-// ─── Tasks list ───────────────────────────────────────────────────────────────
-
-function TaskList({ visible, filter, acting, handleApply, t }) {
-  return (
-    <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col gap-3">
-      {visible.length === 0 && (
-        <div className="flex flex-col items-center gap-3 py-16 text-center">
-          <Icon path={mdiCheckCircle} size={2.2} color={t.green} />
-          <p className="font-semibold" style={{ color: t.textPrimary }}>
-            {filter === "Pending" ? "No pending tasks" : "No tasks here"}
-          </p>
-          <p className="text-sm" style={{ color: t.textSub }}>
-            {filter === "Pending"
-              ? "All caught up! Your farm is in good shape."
-              : "Switch filter to see other tasks."}
-          </p>
+      {/* ── RIGHT header ────────────────────────────────────────────────── */}
+      <div
+        className="flex-shrink-0 px-5 pt-5 pb-3"
+        style={{ borderBottom: `1px solid ${t.border}` }}
+      >
+        <div className="flex items-center gap-2 mb-1">
+          <Icon path={mdiChartBar} size={0.75} color={t.accent} />
+          <h1 className="text-lg font-bold" style={{ color: t.textPrimary }}>Farm Reports</h1>
         </div>
-      )}
+        <p className="text-xs" style={{ color: t.textSub }}>
+          Sensor analytics · Yield estimates · Task impact
+        </p>
+      </div>
 
-      {visible.map(task => {
-        const level    = (task.urgency || "LOW").toUpperCase();
-        const colors   = urgencyColors(level, t);
-        const isDone   = task.status === "applied" || task.status === "skipped";
-        const isActing = !!acting[task.id];
+      {/* ── LEFT body: task list ─────────────────────────────────────────── */}
+      <div
+        className="overflow-y-auto px-4 py-4 flex flex-col gap-3"
+        style={{ borderRight: `1px solid ${t.border}` }}
+      >
+        {visible.length === 0 && (
+          <div className="flex flex-col items-center gap-3 py-14 text-center">
+            <Icon path={mdiCheckCircle} size={2} color={t.green} />
+            <p className="font-semibold text-sm" style={{ color: t.textPrimary }}>
+              {filter === "Pending" ? "No pending tasks" : "No tasks here"}
+            </p>
+            <p className="text-xs" style={{ color: t.textSub }}>
+              {filter === "Pending" ? "All caught up!" : "Switch filter to see other tasks."}
+            </p>
+          </div>
+        )}
 
-        return (
-          <div
-            key={task.id}
-            className="rounded-2xl overflow-hidden transition-opacity"
-            style={{
-              background: isDone ? t.panelLight : colors.muted,
-              border:     `1.5px solid ${isDone ? t.border : colors.border + "55"}`,
-              opacity:    isDone ? 0.6 : 1,
-            }}
-          >
-            <div style={{ height: "3px", background: isDone ? t.border : colors.bg }} />
-            <div className="p-4 flex flex-col gap-3">
-              <div className="flex items-center gap-2">
-                <Icon path={URGENCY_ICON[level] || mdiInformationOutline} size={0.7}
-                  color={isDone ? t.textMuted : colors.bg} />
-                <Pill label={level} color={isDone ? t.border : colors.bg} size="sm" />
-                <span className="text-xs font-semibold ml-auto" style={{ color: t.textMuted }}>
-                  Zone {task.zone_id}
-                </span>
-              </div>
+        {visible.map(task => {
+          const level    = (task.urgency || "LOW").toUpperCase();
+          const colors   = urgencyColors(level, t);
+          const isDone   = task.status === "applied" || task.status === "skipped";
+          const isActing = !!acting[task.id];
 
-              <p className="text-sm font-semibold leading-snug" style={{ color: t.textPrimary }}>
-                {task.action_label || task.action || task.recommendation || "Review zone conditions"}
-              </p>
+          return (
+            <div
+              key={task.id}
+              className="rounded-2xl overflow-hidden transition-opacity"
+              style={{
+                background: isDone ? t.panelLight : colors.muted,
+                border:     `1.5px solid ${isDone ? t.border : colors.border + "55"}`,
+                opacity:    isDone ? 0.6 : 1,
+              }}
+            >
+              <div style={{ height: "3px", background: isDone ? t.border : colors.bg }} />
+              <div className="p-3 flex flex-col gap-2.5">
 
-              {task.reason && (
-                <p className="text-xs leading-relaxed" style={{ color: t.textSub }}>{task.reason}</p>
-              )}
-
-              {task.confidence != null && (
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span style={{ fontSize: "0.68rem", color: t.textMuted }}>Confidence</span>
-                    <span style={{ fontSize: "0.68rem", color: t.textSub, fontWeight: 600 }}>
-                      {(task.confidence * 100).toFixed(0)}%
-                    </span>
-                  </div>
-                  <div style={{ height: 4, borderRadius: 99, background: t.border }}>
-                    <div style={{
-                      height: "100%", borderRadius: 99,
-                      width: `${(task.confidence * 100).toFixed(0)}%`,
-                      background: colors.bg,
-                    }} />
-                  </div>
-                </div>
-              )}
-
-              {!isDone && (
-                <div className="flex gap-2 mt-1">
-                  <button
-                    onClick={() => handleApply(task, true)}
-                    disabled={isActing}
-                    className="flex-1 flex items-center justify-center gap-2 rounded-xl py-2.5 font-semibold text-sm transition-opacity no-focus-ring"
-                    style={{ background: colors.bg, color: colors.text, opacity: isActing ? 0.6 : 1,
-                      border: "none", cursor: "pointer" }}
-                  >
-                    <Icon path={mdiCheckCircle} size={0.65} />
-                    {acting[task.id] === "applying" ? "Saving…" : "Done"}
-                  </button>
-                  <button
-                    onClick={() => handleApply(task, false)}
-                    disabled={isActing}
-                    className="flex items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 font-semibold text-sm transition-opacity no-focus-ring"
-                    style={{ background: t.bgCard, color: t.textSub, border: `1.5px solid ${t.border}`,
-                      opacity: isActing ? 0.6 : 1, cursor: "pointer" }}
-                  >
-                    <Icon path={mdiCloseCircleOutline} size={0.62} />
-                    Skip
-                  </button>
-                </div>
-              )}
-
-              {isDone && (
-                <div className="flex items-center gap-1.5">
-                  <Icon
-                    path={task.status === "applied" ? mdiCheckCircle : mdiCloseCircleOutline}
-                    size={0.6} color={task.status === "applied" ? t.green : t.textMuted}
-                  />
-                  <span className="text-xs font-semibold" style={{ color: t.textMuted }}>
-                    {task.status === "applied" ? "Completed" : "Skipped"}
+                {/* Top row */}
+                <div className="flex items-center gap-2">
+                  <Icon path={URGENCY_ICON[level] || mdiInformationOutline} size={0.65}
+                    color={isDone ? t.textMuted : colors.bg} />
+                  <Pill label={level} color={isDone ? t.border : colors.bg} size="sm" />
+                  <span className="text-xs font-semibold ml-auto" style={{ color: t.textMuted }}>
+                    Zone {task.zone_id}
                   </span>
                 </div>
-              )}
+
+                {/* Action */}
+                <p className="text-sm font-semibold leading-snug" style={{ color: t.textPrimary }}>
+                  {task.action_label || task.action || task.recommendation || "Review zone conditions"}
+                </p>
+
+                {task.reason && (
+                  <p className="text-xs leading-relaxed" style={{ color: t.textSub }}>{task.reason}</p>
+                )}
+
+                {/* Yield impact */}
+                {task.yield_impact && (
+                  <div style={{
+                    background: t.bgCard, borderRadius: 10,
+                    padding: "7px 10px",
+                    border: `1px solid ${t.border}`,
+                    display: "flex", gap: 14, alignItems: "center",
+                  }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      <Icon path={mdiSprout} size={0.55} color={t.textMuted} />
+                      <span style={{ fontSize: "0.68rem", color: t.textMuted }}>Yield impact</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <Icon path={mdiTrendingDown} size={0.5} color={t.red} />
+                      <span style={{ fontSize: "0.7rem", color: t.red, fontWeight: 700 }}>
+                        −{task.yield_impact.loss_kg_ha} kg/ha
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <Icon path={mdiTrendingUp} size={0.5} color={t.green} />
+                      <span style={{ fontSize: "0.7rem", color: t.green, fontWeight: 700 }}>
+                        +{task.yield_impact.recovery_kg_ha} kg/ha
+                      </span>
+                      <span style={{ fontSize: "0.63rem", color: t.textMuted }}>
+                        if acted ({task.yield_impact.pct_recovery}% recovery)
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Confidence bar */}
+                {task.confidence != null && (
+                  <div>
+                    <div className="flex justify-between mb-1">
+                      <span style={{ fontSize: "0.65rem", color: t.textMuted }}>Model confidence</span>
+                      <span style={{ fontSize: "0.65rem", color: t.textSub, fontWeight: 600 }}>
+                        {(task.confidence * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div style={{ height: 3, borderRadius: 99, background: t.border }}>
+                      <div style={{
+                        height: "100%", borderRadius: 99,
+                        width: `${(task.confidence * 100).toFixed(0)}%`,
+                        background: colors.bg,
+                      }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Net benefit */}
+                {task.net_benefit_usd != null && (
+                  <p style={{ fontSize: "0.68rem", color: t.green, fontWeight: 600 }}>
+                    Est. net benefit: +${task.net_benefit_usd}
+                  </p>
+                )}
+
+                {/* Buttons */}
+                {!isDone && (
+                  <div className="flex gap-2 mt-0.5">
+                    <button
+                      onClick={() => handleApply(task, true)}
+                      disabled={isActing}
+                      className="flex-1 flex items-center justify-center gap-2 rounded-xl py-2 font-semibold text-sm no-focus-ring"
+                      style={{ background: colors.bg, color: colors.text,
+                        opacity: isActing ? 0.6 : 1, border: "none", cursor: "pointer" }}
+                    >
+                      <Icon path={mdiCheckCircle} size={0.6} />
+                      {acting[task.id] === "applying" ? "Saving…" : "Done"}
+                    </button>
+                    <button
+                      onClick={() => handleApply(task, false)}
+                      disabled={isActing}
+                      className="flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 font-semibold text-sm no-focus-ring"
+                      style={{ background: t.bgCard, color: t.textSub,
+                        border: `1.5px solid ${t.border}`,
+                        opacity: isActing ? 0.6 : 1, cursor: "pointer" }}
+                    >
+                      <Icon path={mdiCloseCircleOutline} size={0.58} />
+                      Skip
+                    </button>
+                  </div>
+                )}
+
+                {isDone && (
+                  <div className="flex items-center gap-1.5">
+                    <Icon
+                      path={task.status === "applied" ? mdiCheckCircle : mdiCloseCircleOutline}
+                      size={0.58}
+                      color={task.status === "applied" ? t.green : t.textMuted}
+                    />
+                    <span className="text-xs font-semibold" style={{ color: t.textMuted }}>
+                      {task.status === "applied" ? "Completed" : "Skipped"}
+                    </span>
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
+
+      {/* ── RIGHT body: reports ──────────────────────────────────────────── */}
+      <div className="overflow-y-auto px-5 py-4">
+        <ReportsPanel zones={zones} tasks={tasks} t={t} />
+      </div>
     </div>
   );
 }
@@ -294,30 +322,135 @@ function ReportsPanel({ zones, tasks, t }) {
   ];
 
   const sel = METRIC_OPTS.find(m => m.key === metric);
-  const pending = tasks.filter(t => t.status === "pending").length;
-  const done    = tasks.filter(t => t.status === "applied" || t.status === "skipped").length;
+  const pending = tasks.filter(tk => tk.status === "pending").length;
+  const done    = tasks.filter(tk => tk.status === "applied" || tk.status === "skipped").length;
+
+  // Aggregate yield across all zones
+  const zonesWithYield = zones.filter(z => z.yield_estimate);
+  const totalCurrentKg = zonesWithYield.reduce((s, z) =>
+    s + (z.yield_estimate.current_kg_ha * (z.area_ha || 1)), 0);
+  const totalPotentialKg = zonesWithYield.reduce((s, z) =>
+    s + (z.yield_estimate.potential_kg_ha * (z.area_ha || 1)), 0);
+  const yieldGapKg = totalPotentialKg - totalCurrentKg;
+  const yieldPct = totalPotentialKg > 0
+    ? Math.round((totalCurrentKg / totalPotentialKg) * 100) : 0;
 
   return (
-    <div className="flex-1 overflow-y-auto px-6 py-5" style={{ paddingBottom: 100 }}>
+    <div style={{ paddingBottom: 40 }}>
 
       {/* ── Summary stat row ── */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 20 }}>
         {[
-          { label: "Total Zones",    val: zones.length,                                         col: t.accent },
-          { label: "Pending Tasks",  val: pending,                                               col: t.amber  },
-          { label: "Completed",      val: done,                                                  col: t.green  },
-          { label: "Avg Moisture",   val: avg(zones, "soil_moisture_20cm").toFixed(0) + "%",     col: t.accent },
+          { label: "Total Zones",   val: zones.length,                              col: t.accent },
+          { label: "Avg Moisture",  val: avg(zones, "soil_moisture_20cm").toFixed(0) + "%", col: t.accent },
+          { label: "Pending Tasks", val: pending,                                   col: t.amber  },
+          { label: "Completed",     val: done,                                      col: t.green  },
         ].map(s => (
-          <div key={s.label} style={{ background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 14, padding: "12px 14px" }}>
-            <span style={{ display: "block", fontSize: "1.5rem", fontWeight: 800, color: s.col, lineHeight: 1 }}>{s.val}</span>
-            <span style={{ display: "block", fontSize: "0.7rem", color: t.textMuted, marginTop: 4 }}>{s.label}</span>
+          <div key={s.label} style={{ background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 12, padding: "10px 12px" }}>
+            <span style={{ display: "block", fontSize: "1.4rem", fontWeight: 800, color: s.col, lineHeight: 1 }}>{s.val}</span>
+            <span style={{ display: "block", fontSize: "0.68rem", color: t.textMuted, marginTop: 3 }}>{s.label}</span>
           </div>
         ))}
       </div>
 
-      {/* ── Metric selector ── */}
+      {/* ── Yield Estimation ── */}
+      <SectionHeader title="Yield Estimation" t={t} />
+      <div style={{ marginTop: 10, marginBottom: 20 }}>
+
+        {/* Farm-wide yield summary card */}
+        {zonesWithYield.length > 0 && (
+          <div style={{
+            background: t.bgCard, border: `1px solid ${t.border}`,
+            borderRadius: 14, padding: "14px 16px", marginBottom: 12,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+              <div>
+                <p style={{ margin: 0, fontSize: "0.72rem", color: t.textMuted, fontWeight: 600 }}>FARM TOTAL YIELD</p>
+                <p style={{ margin: "3px 0 0", fontSize: "1.6rem", fontWeight: 800, color: t.textPrimary, lineHeight: 1 }}>
+                  {Math.round(totalCurrentKg).toLocaleString()}
+                  <span style={{ fontSize: "0.8rem", fontWeight: 500, color: t.textSub, marginLeft: 4 }}>kg</span>
+                </p>
+                <p style={{ margin: "3px 0 0", fontSize: "0.7rem", color: t.textMuted }}>
+                  of {Math.round(totalPotentialKg).toLocaleString()} kg potential ({yieldPct}%)
+                </p>
+              </div>
+              <div style={{ textAlign: "right" }}>
+                <p style={{ margin: 0, fontSize: "0.72rem", color: t.textMuted, fontWeight: 600 }}>YIELD GAP</p>
+                <p style={{ margin: "3px 0 0", fontSize: "1.2rem", fontWeight: 800, color: t.red, lineHeight: 1 }}>
+                  −{Math.round(yieldGapKg).toLocaleString()} kg
+                </p>
+                <p style={{ margin: "3px 0 0", fontSize: "0.68rem", color: t.textMuted }}>recoverable with actions</p>
+              </div>
+            </div>
+            {/* Overall progress bar */}
+            <div style={{ height: 6, borderRadius: 99, background: t.border }}>
+              <div style={{
+                height: "100%", borderRadius: 99,
+                width: `${yieldPct}%`,
+                background: yieldPct >= 80 ? t.green : yieldPct >= 55 ? t.amber : t.red,
+                transition: "width 0.4s ease",
+              }} />
+            </div>
+          </div>
+        )}
+
+        {/* Per-zone yield cards */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {zones.map(z => {
+            const ye = z.yield_estimate;
+            if (!ye) return null;
+            const pct = Math.min(100, Math.round((ye.current_kg_ha / ye.potential_kg_ha) * 100));
+            const col = pct >= 80 ? t.green : pct >= 50 ? t.amber : t.red;
+            return (
+              <div key={z.zone_id} style={{
+                background: t.panelLight, border: `1px solid ${t.border}`,
+                borderLeft: `3px solid ${col}`, borderRadius: 12, padding: "10px 12px",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontWeight: 700, fontSize: "0.8rem", color: t.textPrimary }}>Zone {z.zone_id}</span>
+                    {z.crop_type && (
+                      <span style={{ fontSize: "0.65rem", color: t.textMuted, background: t.bgCard,
+                        padding: "1px 7px", borderRadius: 99, border: `1px solid ${t.border}` }}>
+                        {z.crop_type}
+                      </span>
+                    )}
+                    {z.area_ha && (
+                      <span style={{ fontSize: "0.65rem", color: t.textMuted }}>{z.area_ha} ha</span>
+                    )}
+                  </div>
+                  <span style={{ fontSize: "0.75rem", fontWeight: 700, color: col }}>{pct}%</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 5 }}>
+                  <div style={{ flex: 1, height: 5, borderRadius: 99, background: t.border }}>
+                    <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: col }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 16 }}>
+                  <span style={{ fontSize: "0.68rem", color: t.textSub }}>
+                    <span style={{ fontWeight: 700, color: t.textPrimary }}>{ye.current_kg_ha.toLocaleString()}</span> kg/ha current
+                  </span>
+                  <span style={{ fontSize: "0.68rem", color: t.textSub }}>
+                    <span style={{ fontWeight: 600 }}>{ye.potential_kg_ha.toLocaleString()}</span> kg/ha potential
+                  </span>
+                  <span style={{ fontSize: "0.68rem", color: t.textMuted }}>
+                    {(ye.confidence * 100).toFixed(0)}% confidence
+                  </span>
+                </div>
+                {ye.limiting_factor && (
+                  <p style={{ margin: "5px 0 0", fontSize: "0.65rem", color: t.red }}>
+                    ⚠ {ye.limiting_factor}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* ── Sensor bar chart ── */}
       <SectionHeader title="Sensor Readings by Zone" t={t} />
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10, marginBottom: 16 }}>
+      <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 8, marginBottom: 12 }}>
         {METRIC_OPTS.map(m => (
           <button
             key={m.key}
@@ -325,51 +458,47 @@ function ReportsPanel({ zones, tasks, t }) {
             className="no-focus-ring"
             style={{
               display: "flex", alignItems: "center", gap: 5,
-              padding: "5px 12px", borderRadius: 99,
+              padding: "4px 10px", borderRadius: 99,
               background: metric === m.key ? t.accent : t.panelLight,
               color: metric === m.key ? t.accentText : t.textSub,
-              fontSize: "0.75rem", fontWeight: 600,
+              fontSize: "0.72rem", fontWeight: 600,
               border: "none", cursor: "pointer",
             }}
           >
-            <Icon path={m.icon} size={0.45} color={metric === m.key ? t.accentText : t.textSub} />
+            <Icon path={m.icon} size={0.42} color={metric === m.key ? t.accentText : t.textSub} />
             {m.label}
           </button>
         ))}
       </div>
-
-      {/* ── Bar chart ── */}
       {zones.length > 0 ? (
         <BarChart zones={zones} sel={sel} t={t} />
       ) : (
-        <div style={{ textAlign: "center", padding: "40px 0", color: t.textMuted, fontSize: "0.85rem" }}>
-          No zone data yet.
-        </div>
+        <p style={{ textAlign: "center", padding: "24px 0", color: t.textMuted, fontSize: "0.82rem" }}>No zone data yet.</p>
       )}
 
-      {/* ── All-zone comparison table ── */}
-      <div style={{ marginTop: 28 }}>
+      {/* ── All-zone sensor table ── */}
+      <div style={{ marginTop: 24 }}>
         <SectionHeader title="All-Zone Sensor Summary" t={t} />
-        <div style={{ marginTop: 12, borderRadius: 14, overflow: "hidden", border: `1px solid ${t.border}` }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.78rem" }}>
+        <div style={{ marginTop: 10, borderRadius: 12, overflow: "hidden", border: `1px solid ${t.border}` }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem" }}>
             <thead>
               <tr style={{ background: t.panelLight }}>
-                {["Zone", "Crop", "Moisture", "Nitrogen", "pH", "Temp", "P", "K"].map(h => (
-                  <th key={h} style={{ padding: "9px 12px", textAlign: "left", color: t.textMuted, fontWeight: 600, fontSize: "0.7rem" }}>{h}</th>
+                {["Zone", "Crop", "Moist", "N", "pH", "Temp", "P", "K"].map(h => (
+                  <th key={h} style={{ padding: "8px 10px", textAlign: "left", color: t.textMuted, fontWeight: 600, fontSize: "0.67rem" }}>{h}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
               {zones.map((z, i) => (
                 <tr key={z.zone_id} style={{ background: i % 2 === 0 ? t.bgCard : t.panelLight, borderTop: `1px solid ${t.border}` }}>
-                  <td style={{ padding: "9px 12px", fontWeight: 700, color: t.textPrimary }}>{z.zone_id}</td>
-                  <td style={{ padding: "9px 12px", color: t.textSub }}>{z.crop_type || "—"}</td>
-                  <TdVal val={z.soil_moisture_20cm} unit="%" lo={35} hi={65} t={t} />
-                  <TdVal val={z.nitrogen_ppm}       unit=" ppm" lo={60} hi={140} t={t} />
-                  <TdVal val={z.ph_level}           unit=""  lo={6.0} hi={7.5} t={t} />
-                  <TdVal val={z.temperature_c}      unit="°" lo={20} hi={30} t={t} />
-                  <TdVal val={z.phosphorus_ppm}     unit=" ppm" lo={20} hi={60} t={t} />
-                  <TdVal val={z.potassium_ppm}      unit=" ppm" lo={100} hi={180} t={t} />
+                  <td style={{ padding: "8px 10px", fontWeight: 700, color: t.textPrimary }}>{z.zone_id}</td>
+                  <td style={{ padding: "8px 10px", color: t.textSub }}>{z.crop_type || "—"}</td>
+                  <TdVal val={z.soil_moisture_20cm} unit="%"    lo={35}  hi={65}  t={t} />
+                  <TdVal val={z.nitrogen_ppm}       unit=" N"   lo={60}  hi={140} t={t} />
+                  <TdVal val={z.ph_level}           unit=""     lo={6.0} hi={7.5} t={t} />
+                  <TdVal val={z.temperature_c}      unit="°"    lo={20}  hi={30}  t={t} />
+                  <TdVal val={z.phosphorus_ppm}     unit=" P"   lo={20}  hi={60}  t={t} />
+                  <TdVal val={z.potassium_ppm}      unit=" K"   lo={100} hi={180} t={t} />
                 </tr>
               ))}
             </tbody>
@@ -378,7 +507,7 @@ function ReportsPanel({ zones, tasks, t }) {
       </div>
 
       {/* ── Task urgency breakdown ── */}
-      <div style={{ marginTop: 28 }}>
+      <div style={{ marginTop: 24 }}>
         <SectionHeader title="Task Urgency Breakdown" t={t} />
         <UrgencyDonut tasks={tasks} t={t} />
       </div>
