@@ -387,4 +387,4 @@ python precision_gui.py
 
 ---
 
-*YieldVision — Research-backed farming decisions for Kenyan smallholders.*
+*YieldVision — Research-backed farming decisions for Kenyan smallholders.*-* - 

@@ -8,6 +8,11 @@
 /.vs
 
 /frontend/PWA/node_modules
+/frontend/yieldvision-desktop/node_modules
+/backend/node_modules
+/frontend/yieldvision-desktop/build
+/frontend/yieldvision-desktop/.env.example
+/frontend/yieldvision-desktop/dist
 /__pycache__
 /backend/__pycache__
 /~$eldVision_M2_Report.docx
