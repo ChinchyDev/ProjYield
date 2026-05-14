@@ -1,6 +1,6 @@
 # YieldVision Precision Farming System
 
-A research-backed precision farming decision engine built for Kenyan smallholder farmers. YieldVision uses a sensor-equipped autonomous rover to map soil health across farm zones and generate actionable, science-grounded recommendations — telling farmers exactly what to apply, how much it costs in KES, and why.
+A precision farming decision engine built for Kenyan smallholder farmers. YieldVision uses a sensor-equipped rover to map soil health across farm zones and generate plain-language, science-backed recommendations — telling farmers exactly what to apply, how much it costs in KES, and why.
 
 ---
 
@@ -10,7 +10,7 @@ Most farming apps tell you your soil is "low in nitrogen." YieldVision tells you
 
 > *"Zone A2 needs 46 grams of CAN fertilizer (~KES 3). Apply before next rain. Based on your maize variety (H614D) and current soil readings. Confidence: High — based on published KALRO research."*
 
-Every number is traceable to a sensor reading or a published agricultural science source. Nothing is made up.
+Every number traces back to either a sensor reading or a published agricultural science source.
 
 ---
 
@@ -22,29 +22,31 @@ Every number is traceable to a sensor reading or a published agricultural scienc
 │                                                              │
 │  FastAPI (Port 8000)   ──►  PostgreSQL (Port 5432)          │
 │  ML Decision Engine    ──►  PostGIS (Spatial queries)       │
-│  Python Desktop GUI    ──►  Market Price Cache (KAMIS)      │
+│  React + Electron App  ──►  Market Price Cache (KAMIS)      │
 └──────────────────────────────┬───────────────────────────────┘
-                               │ WiFi (sync only)
+                               │ WiFi (sync only, not required)
                                │
 ┌──────────────────────────────▼───────────────────────────────┐
 │                    ARDUINO ROVER (ROVER_01)                   │
 │                                                              │
 │  Arduino Mega 2560                                           │
-│  ├── ComWinTop 7-in-1 Soil Sensor (RS485/MAX485)            │
-│  │   └── NPK, pH, Moisture, Soil Temp, EC                   │
+│  ├── 7-in-1 RS485 Soil Probe (ComWinTop / similar)          │
+│  │   └── NPK, pH, Moisture, Soil Temp, EC (via MAX485)      │
 │  ├── DHT22 (Air Temp + Humidity)                            │
-│  ├── NEO-6M GPS Module                                       │
+│  ├── GY-NEO6MV2 GPS Module                                  │
+│  ├── Capacitive Moisture Sensor v2 (backup moisture)        │
 │  ├── SD Card Module (offline data storage)                  │
-│  └── Motor Driver (rover movement)                          │
+│  ├── ESP8266 (SoftAP, SSID "YieldVision", 192.168.4.1)     │
+│  └── AFMotor Shield (rover movement)                        │
 │                                                              │
-│  Power: 4× 18650 batteries (14.8V) → motors + sensors      │
-│         Powerbank → Arduino Mega + breadboard               │
+│  Power: 4× 18650 batteries → motors + sensors               │
+│         Powerbank → Arduino Mega + breadboard                │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Principle: Offline-First
 
-The rover **never needs WiFi to collect data.** It collects and saves to SD card regardless of connectivity. WiFi is only used for syncing data to the server and downloading updated farm profiles. If WiFi is unavailable, nothing is lost.
+The rover **never needs WiFi to collect data.** It logs to SD card regardless of connectivity. WiFi (via the ESP8266 SoftAP) is only used to sync data to the laptop server and receive rover control commands. No router required — the rover creates its own network.
 
 ---
 
@@ -53,20 +55,38 @@ The rover **never needs WiFi to collect data.** It collects and saves to SD card
 | Component | Model | Purpose |
 |---|---|---|
 | Microcontroller | Arduino Mega 2560 | Main controller |
-| Soil Sensor | ComWinTop 7-in-1 (RS485) | NPK, pH, moisture, soil temp, EC |
+| Soil Sensor | 7-in-1 RS485 probe (ComWinTop-style) | NPK, pH, moisture, soil temp, EC |
+| RS485 Interface | MAX485 Module | RS485 to UART conversion |
 | Air Sensor | DHT22 | Air temperature + humidity |
-| GPS | NEO-6M | Zone identification |
-| Communication | MAX485 Module | RS485 to UART for soil sensor |
+| GPS | GY-NEO6MV2 | Zone identification |
+| Backup Moisture | Capacitive Moisture Sensor v2 | ~KES 300, moisture redundancy |
+| WiFi | ESP8266 (SoftAP mode) | Rover control + data relay, no router needed |
 | Storage | SD Card Module | Offline data buffer |
-| Connectivity | ESP8266 / WiFi Shield | Server sync |
-| Motor Power | 4× 18650 (14.8V pack) | Drive motors + sensors |
+| Motor Control | AFMotor Shield | Drive motors (WASD + GUI control) |
+| Motor Power | 4× 18650 (14.8V pack) | Drive + sensors |
 | Logic Power | Powerbank | Arduino Mega + breadboard |
+
+> **Sourcing note:** The 7-in-1 probe is available on AliExpress for ~$8–12 (search "7 in 1 soil sensor RS485 NPK pH EC"). If your sensor is a different brand (e.g. Sunicon vs. ComWinTop), the register order or default baud rate may differ by two lines in `sensor_7in1.h` — always cross-check your product manual.
+
+---
+
+## Frontend
+
+The desktop interface is built with **React + Electron**, shipping as both a proper installable desktop app and a PWA from a single codebase. No separate Python GUI.
+
+- Offline-first with local cache (last 2 hours of data available without server)
+- GPS-based dynamic zone mapping
+- Urgency-coded colour scheme with floating bottom navigation
+- Dark/light mode
+- Fully wired to FastAPI backend
+
+> Design palette: `#1B2727 #3C5148 #6B8E4E #B2C5B2 #D5DDDF`
 
 ---
 
 ## Database Design
 
-PostgreSQL only — InfluxDB removed. All time-series data lives in PostgreSQL with proper indexing.
+PostgreSQL only (InfluxDB removed). All time-series data lives in PostgreSQL with proper indexing and PostGIS for spatial queries.
 
 ### Core Tables
 
@@ -100,7 +120,7 @@ PostgreSQL only — InfluxDB removed. All time-series data lives in PostgreSQL w
 
 ### Architecture Decisions Baked In
 
-1. **Row Level Security** on every table with `farm_id` — database physically cannot return another farm's data regardless of query
+1. **Row Level Security** — every table with `farm_id` uses RLS; the database physically cannot return another farm's data
 2. **Polygon containment zones** — zone identity is a human label (A1, Z01), GPS used only for spatial math via PostGIS
 3. **Idempotent uploads** — rover generates `reading_uuid = rover_id + timestamp_ms + seq` at collection time; server uses `ON CONFLICT DO NOTHING` so retrying uploads never creates duplicates
 4. **Single staleness view** — one definition of "stale", enforced once, trusted everywhere
@@ -151,10 +171,10 @@ All irrigation math is traceable to FAO Irrigation and Drainage Paper No. 56.
 
 ```
 Water to apply (liters) =
-  (Field Capacity % - Current Moisture %) 
-  × Bulk Density 
-  × Root Depth 
-  × Zone Area 
+  (Field Capacity % - Current Moisture %)
+  × Bulk Density
+  × Root Depth
+  × Zone Area
   × Drainage Factor
   ÷ 1000
 
@@ -176,6 +196,10 @@ Ra (extraterrestrial radiation) is a published lookup by latitude and month — 
 
 This prevents the most common money-wasting mistake in Kenyan smallholder farming: spending KES 2,000 on fertilizer for acidic soil where nutrients cannot be absorbed.
 
+### Why EC Can't Be Skipped
+
+Electrical conductivity (EC) is architecturally required — the decision engine uses it to validate the `HIGH_EC_LOW_NPK` flag that catches sensor errors and scores data quality confidence. It can't be substituted cheaply and still pass that check.
+
 ### Fertilizer Translation
 
 Recommendations are never in abstract units. Always:
@@ -187,7 +211,7 @@ Translation chain: `sensor ppm deficit → kg nutrient needed → grams of speci
 ### Urgency Scoring
 
 ```
-Urgency score = 
+Urgency score =
   (Deviation from optimal / Optimal range)
   × Growth stage multiplier (2.0× at germination/flowering, 0.5× at maturity)
   × Ignored penalty (0.7× if same recommendation previously ignored)
@@ -238,10 +262,10 @@ Every number in the recommendation engine is traceable to one of these:
 | KALRO Soil Acidity and Liming Handbook for Kenya (2023) | Lime application rates for Kenyan soils |
 | IFDC Fertilizer Use by Crop in Kenya | NPK requirements, fertilizer product recommendations |
 | IFDC Fertilizer Quality Assessment in Markets of Kenya | Actual NPK % in Kenyan market fertilizers |
-| AGRA/IFDC Fertilizer Blends Kenya (2018) | Kenyan fertilizer product catalogue and prices |
 | ECOCROP (FAO) | Crop growing condition ranges |
 | KALRO Crop Variety Catalogue (2023) | Kenyan variety performance data |
 | KAMIS (Kenya Agri. Market Information System) | Live market prices |
+| NPKGRIDS dataset (Kalleske et al., 2024) | Soil nutrient spatial reference |
 
 ---
 
@@ -262,30 +286,32 @@ Market prices cached from **KAMIS** (Kenya Agricultural Market Information Syste
 
 ```
 ProjYield/
-├── database_setup.sql          # Full PostgreSQL schema (v2.0)
-├── main_server.py              # FastAPI backend
-├── precision_gui.py            # Desktop GUI (CustomTkinter)
-├── precision_models.py         # ML models (YieldSoil, YieldSeed)
-├── requirements.txt            # Python dependencies
-├── README.md                   # This file
+├── backend/
+│   ├── main_server.py          # FastAPI backend (all API endpoints)
+│   ├── decision_engine.py      # Recommendation orchestrator
+│   ├── precision_models.py     # YieldSoil + YieldSeed models
+│   ├── irrigation_engine.py    # FAO56 irrigation math
+│   ├── edge_storage.py         # SQLite edge storage + PostgreSQL sync
+│   └── database_setup.sql      # Full PostgreSQL schema (v2.0)
 │
-├── arduino_rover/
-│   └── rover_controller.ino   # Arduino rover firmware
+├── rover/
+│   ├── mega_rover.ino          # Arduino Mega main sketch (motors + sensors)
+│   └── esp8266_wifi.ino        # ESP8266 SoftAP + command bridge
 │
-├── mock_data/
-│   ├── mock_historical_data.sql    # 2 past seasons for demo soil box
-│   └── mock_sensor_readings.json   # Synthetic readings for testing
+├── frontend/
+│   └── PWA/src/
+│       ├── App.js              # Main app shell + navigation
+│       ├── api.js              # FastAPI client with offline cache
+│       └── components/
+│           ├── Dashboard.js
+│           ├── Farm.js
+│           ├── Tasks.js
+│           ├── Reports.js
+│           ├── Alerts.js
+│           └── RecommendationModal.js
 │
-└── docs/
-    └── PROJECT_REPORT_M2_UPDATE.md
-```
-
-Files to be created next:
-```
-├── zone_generator.py           # Polygon zone creation from GPS boundary drive
-├── farm_manager.py             # Farm profile, rover assignment, GPS detection
-├── rover_sync.py               # SD card batch upload handler
-├── decision_engine.py          # Recommendation generation with full calc trace
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -296,78 +322,41 @@ Files to be created next:
 
 - Python 3.8+
 - PostgreSQL 14+ with PostGIS extension
+- Node.js 18+ (for React/Electron frontend)
 - Arduino IDE (for rover firmware)
-- Windows laptop (development server)
 
 ### Database Setup
 
 ```bash
 # Install PostGIS via Stack Builder (comes with PostgreSQL on Windows)
 # Then in psql:
-psql -U postgres -f database_setup.sql
+psql -U postgres -f backend/database_setup.sql
 ```
 
 ### Python Server
 
 ```bash
 pip install -r requirements.txt
-python main_server.py
+python backend/main_server.py
 ```
 
-### GUI
+### Frontend (React + Electron)
 
 ```bash
-python precision_gui.py
+cd frontend
+npm install
+npm start          # development (PWA in browser)
+npm run electron   # desktop app
 ```
 
 ### Arduino
 
-1. Open `arduino_rover/rover_controller.ino` in Arduino IDE
-2. Set WiFi credentials and server IP
-3. Upload to Arduino Mega 2560
-
----
-
-## Development Roadmap
-
-### Phase 1 — Hardware Integration *(current)*
-- [ ] Wire ComWinTop sensor via MAX485
-- [ ] Confirm NPK, pH, moisture readings on serial monitor
-- [ ] DHT22 air readings working
-- [ ] NEO-6M GPS fix confirmed
-- [ ] SD card read/write working
-- [ ] End-to-end: sensor → SD → WiFi → PostgreSQL
-
-### Phase 2 — Real Data Pipeline
-- [ ] Farm boundary capture via GPS drive
-- [ ] Zone polygon generation (zone_generator.py)
-- [ ] SD card batch sync (rover_sync.py)
-- [ ] Idempotent upload confirmed (retry test)
-- [ ] zone_current_state view returning correct staleness flags
-
-### Phase 3 — Crop Data & Knowledge Base
-- [ ] All 9 crop varieties seeded in database
-- [ ] Soil type reference table validated against FAO56
-- [ ] Fertilizer products table with current KES prices
-- [ ] Growth stage auto-calculation from planting date working
-
-### Phase 4 — Decision Engine
-- [ ] pH hard gate implemented and tested
-- [ ] Irrigation volume calc traced to FAO56
-- [ ] Fertilizer translation (ppm → grams → KES)
-- [ ] Urgency scoring on all recommendations
-- [ ] Plain language confidence labels
-
-### Phase 5 — Onboard Intelligence (Arduino)
-- [ ] Point-in-polygon zone detection on Arduino
-- [ ] Farm profile stored and read from SD card
-- [ ] Offline-first flow confirmed (no WiFi needed for collection)
-
-### Phase 6 — Demo Polish
-- [ ] Mock historical data (2 seasons) loaded for demo soil box
-- [ ] GUI showing zone map, recommendations, KES costs
-- [ ] KAMIS price integration (or hardcoded current prices for demo)
-- [ ] Full demo flow: power on rover → collect → sync → recommendation appears in GUI
+1. Open `rover/mega_rover.ino` in Arduino IDE
+2. Open `rover/esp8266_wifi.ino` for the ESP8266 (separate upload)
+3. Upload Mega sketch to Arduino Mega 2560
+4. Upload ESP8266 sketch to ESP8266 module
+5. Laptop connects to WiFi SSID "YieldVision", password "rover1234"
+6. React app available at `http://localhost:3000`, API at `http://localhost:8000`
 
 ---
 
@@ -376,15 +365,28 @@ python precision_gui.py
 | Component | Status |
 |---|---|
 | Database schema v2.0 | ✅ Complete |
-| Crop varieties seed data | ✅ 9 varieties loaded |
-| Fertilizer products (KES) | ✅ 11 products loaded |
-| Soil type reference (FAO56) | ✅ 5 soil types loaded |
-| Arduino rover firmware | 🔄 In progress |
-| Hardware wiring | ⏳ Hardware in transit |
-| Decision engine | ⏳ Next |
-| Farm boundary capture GUI | ⏳ Next |
-| Mock historical data | ⏳ Next |
+| Crop varieties seed data (9 varieties) | ✅ Complete |
+| Fertilizer products table (11 Kenyan products, KES prices) | ✅ Complete |
+| Soil type reference (FAO56) | ✅ Complete |
+| FastAPI backend (all endpoints) | ✅ Complete |
+| Decision engine + recommendation logic | ✅ Complete |
+| Irrigation engine (FAO56-traced) | ✅ Complete |
+| Arduino rover firmware (motors + sensors) | ✅ Complete |
+| ESP8266 SoftAP + command bridge | ✅ Complete |
+| React + Electron frontend (26 files) | ✅ Complete |
+| Hardware components | ⏳ Ordered (AliExpress, delivery pending) |
+| Physical sensor validation | ⏳ Awaiting hardware |
+| GitHub README (was outdated) | ✅ Now updated |
+
+### Pending Academic Documentation
+
+- [ ] Data Flow Diagrams (DFDs)
+- [ ] ER Diagrams
+- [ ] Field testing results
+- [ ] ML model evaluation
+- [ ] Sensor justification write-up
+- [ ] UI screenshots
 
 ---
 
-*YieldVision — Research-backed farming decisions for Kenyan smallholders.*-* - 
+*YieldVision — Research-backed farming decisions for Kenyan smallholders.*
